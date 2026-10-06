@@ -1,0 +1,265 @@
+# =============================================================================
+# k8s/optional/ollama.yaml — local LLM server (Option 2: CHATBOT_MODE=llm)
+# =============================================================================
+# NOT part of k8s/base. Enable the LLM mode with:
+#
+#   kubectl apply -f k8s/optional/ollama.yaml
+#   kubectl -n scalebotai rollout status deployment/ollama --timeout=600s   # first start downloads the model
+#   kubectl -n scalebotai patch configmap scalebotai-config \
+#       --type merge -p '{"data":{"CHATBOT_MODE":"llm"}}'
+#   kubectl -n scalebotai rollout restart deployment/scalebotai-api          # env vars are read at start
+#
+# The API calls http://ollama:11434/api/chat (OLLAMA_BASE_URL) with model
+# `tinyllama` and falls back to the rule engine on timeout (bot_mode
+# "rule-fallback"), so the chatbot stays available even if Ollama is slow.
+#
+# Sizing: TinyLlama 1.1B (Q4, ~640 MB on disk) needs ~1-1.5 GiB RAM while
+# loaded; CPU inference is slow-ish (hundreds of ms to seconds per answer),
+# which is why `rule` is the default mode for the 1M req/day target.
+#
+# GPU notes (production):
+#   * Install the NVIDIA GPU Operator / device plugin; nodes then advertise
+#     `nvidia.com/gpu`.
+#   * Add to the container:   resources.limits."nvidia.com/gpu": 1
+#   * Steer to GPU nodes:     nodeSelector / tolerations for the GPU taint, e.g.
+#       tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+#   * GPUs cannot be shared between pods by default (whole-device allocation;
+#     use time-slicing or MIG to share).
+#   * Scale Ollama separately from the API (its own HPA on GPU utilisation via
+#     DCGM exporter + custom metrics), because LLM capacity is the bottleneck.
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-data
+  namespace: scalebotai
+  labels:
+    app: ollama
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/part-of: scalebotai
+spec:
+  # No storageClassName => the cluster's DEFAULT StorageClass provisions the
+  # volume dynamically (minikube: "standard", EKS: gp2/gp3, GKE: standard-rwo).
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: scalebotai
+  labels:
+    app: ollama
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/part-of: scalebotai
+spec:
+  type: ClusterIP
+  selector:
+    app: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: scalebotai
+  labels:
+    app: ollama
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: llm
+    tier: llm
+spec:
+  replicas: 1
+  # RWO volume holding the model -> stop the old pod before starting the new one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+        app.kubernetes.io/name: ollama
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: llm
+        tier: llm
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      # The official image runs as root; we run it as an arbitrary non-root
+      # uid ("restricted" Pod Security) and point HOME/OLLAMA_MODELS at the
+      # writable volume instead of /root/.ollama.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        fsGroup: 10002
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # ---- initContainer: download the model BEFORE the server takes traffic --
+      # initContainers run to completion, in order, before the main containers
+      # start. We start a temporary server on localhost, `ollama pull` the
+      # model into the shared volume, then stop it. On later restarts the
+      # model is already on the PVC, so the pull only checks the manifest
+      # (and is skipped gracefully if the registry is unreachable).
+      initContainers:
+        - name: pull-model
+          image: ollama/ollama:0.5.7
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              ollama serve >/tmp/serve.log 2>&1 &
+              SERVER_PID=$!
+              for i in $(seq 1 60); do
+                if ollama list >/dev/null 2>&1; then break; fi
+                sleep 1
+              done
+              if ollama pull "${OLLAMA_MODEL}"; then
+                echo "model ${OLLAMA_MODEL} ready"
+              elif ollama list | grep -q "^${OLLAMA_MODEL}"; then
+                echo "pull failed but cached model ${OLLAMA_MODEL} found, continuing"
+              else
+                echo "could not pull ${OLLAMA_MODEL}" >&2
+                kill "$SERVER_PID" || true
+                exit 1
+              fi
+              kill "$SERVER_PID" || true
+          env:
+            - name: OLLAMA_HOST
+              value: "127.0.0.1:11434"
+            - name: HOME
+              value: /data
+            - name: OLLAMA_MODELS
+              value: /data/models
+            - name: OLLAMA_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: scalebotai-config
+                  key: OLLAMA_MODEL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: ollama
+          # Pin a tested version (see hub.docker.com/r/ollama/ollama/tags).
+          image: ollama/ollama:0.5.7
+          imagePullPolicy: IfNotPresent
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 11434
+              protocol: TCP
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            - name: HOME
+              value: /data
+            - name: OLLAMA_MODELS
+              value: /data/models
+            # Keep the model loaded in RAM (avoid a cold load on every request).
+            - name: OLLAMA_KEEP_ALIVE
+              value: "24h"
+            # How many requests one model instance serves concurrently.
+            - name: OLLAMA_NUM_PARALLEL
+              value: "2"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 3Gi
+              # nvidia.com/gpu: 1     # GPU nodes only (see header)
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            # /api/tags lists local models — succeeds once the server is up.
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: ollama-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+# The base namespace denies all egress. Ollama must reach the model registry
+# (registry.ollama.ai + its CDN over HTTPS) to download TinyLlama. Allow 443
+# to the public internet only (not to private/cluster ranges).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ollama-model-download
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: ollama
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

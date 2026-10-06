@@ -1,0 +1,8 @@
+# Test / lint tooling (CI only - never installed in the runtime image)
+-r requirements.txt
+pytest==9.1.1
+pytest-cov==7.1.0
+aiosqlite==0.22.1
+fakeredis==2.39.0
+ruff==0.16.10
+bandit[toml]==1.9.4

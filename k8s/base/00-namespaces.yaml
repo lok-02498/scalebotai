@@ -1,0 +1,87 @@
+# =============================================================================
+# 00-namespaces.yaml — the three namespaces of ScaleBotAI
+# =============================================================================
+# A Namespace is a virtual cluster inside the physical cluster. We use three so
+# that each concern gets its own blast radius, RBAC scope, NetworkPolicy scope
+# and Pod Security level:
+#
+#   scalebotai  -> the product: API pods, PostgreSQL, Redis, (optional) Ollama
+#   monitoring  -> Prometheus, Grafana, kube-state-metrics
+#   logging     -> Elasticsearch, Logstash, Kibana, Filebeat (ELK/EFK)
+#
+# Pod Security Admission (PSA) labels
+# -----------------------------------
+# PSA is the built-in admission controller (GA since v1.25) that replaced
+# PodSecurityPolicy. Three standard levels exist:
+#   privileged -> no restrictions
+#   baseline   -> blocks known privilege escalations (hostPath, hostNetwork,
+#                 privileged containers, extra capabilities, ...)
+#   restricted -> baseline + hardening: must run as non-root, must drop ALL
+#                 capabilities, allowPrivilegeEscalation=false, seccomp
+#                 RuntimeDefault, only "safe" volume types (PVC, configMap,
+#                 secret, emptyDir, projected, downwardAPI, csi, ephemeral).
+# Three modes per level:
+#   enforce -> pods that violate the level are REJECTED
+#   audit   -> violations are recorded in the API-server audit log
+#   warn    -> violations are returned to the user as kubectl warnings
+# "-version: latest" means "use the rules of the cluster's current version".
+#
+# NOTE: these three Namespace objects are duplicated verbatim in
+# k8s/monitoring/namespace.yaml and k8s/logging/namespace.yaml so those stacks
+# can be applied on their own. Keep the copies identical: kubectl apply
+# removes labels that disappear from the last applied manifest.
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai
+    # Every pod in this namespace (API, Postgres, Redis, Ollama, exporters) is
+    # written to satisfy "restricted", so we enforce the strictest level.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/name: monitoring
+    # Prometheus, Grafana and kube-state-metrics all run as non-root with
+    # dropped capabilities and only use PVC/configMap/secret/emptyDir volumes,
+    # so "restricted" is achievable here too. (Prometheus reads kubelet/cAdvisor
+    # metrics over HTTPS via the node IP — no hostPath/hostNetwork needed.)
+    # If you later add node-exporter (needs hostNetwork/hostPID/hostPath) give
+    # it its own namespace labelled "privileged" instead of weakening this one.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    app.kubernetes.io/name: logging
+    # The logging stack legitimately needs host access:
+    #  * Filebeat (DaemonSet) mounts hostPath /var/log/containers and runs as
+    #    root to read every container's log file  -> forbidden by baseline.
+    #  * Elasticsearch needs a privileged initContainer to raise the node
+    #    kernel setting vm.max_map_count          -> forbidden by baseline.
+    # So we ENFORCE "privileged" but still AUDIT/WARN against "baseline" so any
+    # *unexpected* privileged workload is visible. This is the documented
+    # "baseline otherwise" exception; keep this namespace small and audited.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/warn-version: latest

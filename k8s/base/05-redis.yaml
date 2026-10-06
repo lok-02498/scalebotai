@@ -1,0 +1,195 @@
+# =============================================================================
+# 05-redis.yaml — Redis 7 (cache, rate-limit counters, JWT denylist, stats)
+# =============================================================================
+# Deployment (not StatefulSet) because Redis here is a single-instance cache
+# with optional persistence: it needs no stable network identity or ordering.
+# A replicated/HA Redis would use a StatefulSet + Sentinel, Redis Cluster, an
+# operator, or a managed service (ElastiCache / Memorystore).
+#
+# What Redis stores (docs/04-database-design.md): bot-response cache, user profile cache,
+# analytics cache, per-minute rate-limit counters, JWT denylist, daily request
+# counters. The API "fails open" if Redis is down (no cache, no rate limit).
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: scalebotai
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: scalebotai
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/version: "7.4"
+    tier: cache
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  # Recreate (not RollingUpdate): the PVC is ReadWriteOnce and two Redis
+  # processes must never append to the same AOF file. Recreate stops the old
+  # pod BEFORE starting the new one (a few seconds of cache downtime, which the
+  # API tolerates by failing open).
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: cache
+        tier: cache
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999     # "redis" user in redis:*-alpine
+        runAsGroup: 1000   # "redis" group in redis:*-alpine
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Wait until the lab hostPath volume is writable for uid 999 (see the
+        # kube-system Job in 03-storage.yaml) instead of crash-looping.
+        - name: wait-for-writable-volume
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              until [ -w /data ]; do
+                echo "waiting for /data to be writable by uid $(id -u) (see k8s/base/03-storage.yaml)"
+                sleep 3
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          # Kubernetes expands $(REDIS_PASSWORD) from the env var defined below
+          # before starting the process (the shell is NOT involved).
+          args:
+            - redis-server
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            # Append-Only File persistence: every write is logged and fsync'ed
+            # once per second -> at most ~1 s of data loss on a crash.
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --dir
+            - /data
+            # Memory cap BELOW the container limit (384Mi) leaves room for
+            # fragmentation and the fork used by AOF rewrites.
+            - --maxmemory
+            - 256mb
+            # When full, evict the Least-Recently-Used key among ALL keys.
+            # Right for a cache. Trade-off: under memory pressure a JWT-denylist
+            # entry could also be evicted; for strict guarantees move the
+            # denylist to a separate Redis with `noeviction`.
+            - --maxmemory-policy
+            - allkeys-lru
+            # Close idle client connections after 5 minutes.
+            - --timeout
+            - "300"
+            - --tcp-keepalive
+            - "60"
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: scalebotai-secrets
+                  key: REDIS_PASSWORD
+            # redis-cli reads REDISCLI_AUTH automatically, so probes do not need
+            # `-a <password>` on the command line (which would show up in `ps`).
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: scalebotai-secrets
+                  key: REDIS_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          # Loading a big AOF can take a while: allow up to 60 s.
+          startupProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 5
+            failureThreshold: 12
+          # Liveness only checks the port: a Redis that is busy LOADING still
+          # answers TCP and must not be killed.
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness requires an authenticated PONG (fails while LOADING or if
+          # the password is wrong).
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -h 127.0.0.1 ping | grep -q PONG"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # Redis only writes to /data
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-data

@@ -1,0 +1,174 @@
+# =============================================================================
+# prometheus.yml for the Kubernetes deployment (ConfigMap `prometheus-config`)
+# =============================================================================
+# docker-compose uses monitoring/prometheus/prometheus.yml (static/DNS
+# targets). In Kubernetes, targets come and go with every scale-up, rollout
+# and crash, so we use SERVICE DISCOVERY instead of fixed targets:
+#
+#   kubernetes-pods         every pod annotated prometheus.io/scrape: "true"
+#                           (scalebotai-api stable/canary/blue/green,
+#                           postgres-exporter, redis-exporter); the `job`
+#                           label is set to the pod's `app` label
+#                           (job="scalebotai-api", "postgres-exporter", ...)
+#   job kubernetes-cadvisor container CPU / memory / network per pod, read
+#                           from each node's kubelet (cAdvisor is built in)
+#   job kubernetes-kubelet  kubelet metrics incl. PVC usage (volume stats)
+#   job kube-state-metrics  object STATE: restarts, HPA replicas, deployment
+#                           availability (see kube-state-metrics.yaml)
+#   job prometheus          Prometheus itself
+#
+# Reload after editing (no restart needed, --web.enable-lifecycle is set):
+#   kubectl apply -k k8s/monitoring
+#   # wait ~1 min for the ConfigMap volume to refresh, then
+#   kubectl -n monitoring port-forward svc/prometheus 9090:9090 &
+#   curl -X POST http://localhost:9090/-/reload
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s          # how often targets are scraped
+      scrape_timeout: 10s
+      evaluation_interval: 15s      # how often alert rules are evaluated
+      external_labels:
+        cluster: scalebotai-k8s
+        environment: production
+
+    # Alert rules (ConfigMap prometheus-rules, mounted at /etc/prometheus/rules).
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    # Uncomment when an Alertmanager is deployed (routes alerts to Slack/email):
+    # alerting:
+    #   alertmanagers:
+    #     - static_configs:
+    #         - targets: ["alertmanager.monitoring.svc:9093"]
+
+    scrape_configs:
+      # ---------------------------------------------------------------------
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # ---------------------------------------------------------------------
+      # Application pods, discovered through the Kubernetes API.
+      # Honors the conventional annotations on the POD TEMPLATE:
+      #   prometheus.io/scrape: "true"   -> keep this pod
+      #   prometheus.io/port:   "8000"   -> scrape this port
+      #   prometheus.io/path:   /metrics -> scrape this path (default /metrics)
+      #   prometheus.io/scheme: https    -> optional
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [scalebotai, monitoring, logging]
+        relabel_configs:
+          # 1) only pods that opted in
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # 2) only running pods (skip Pending/Succeeded/Failed)
+          - source_labels: [__meta_kubernetes_pod_phase]
+            action: keep
+            regex: Running
+          # 3) init containers also show up as targets -> drop them
+          - source_labels: [__meta_kubernetes_pod_container_init]
+            action: drop
+            regex: "true"
+          # 4) optional scheme / path overrides
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scheme]
+            action: replace
+            regex: (https?)
+            target_label: __scheme__
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            regex: (.+)
+            target_label: __metrics_path__
+          # 5) rewrite the address to <pod IP>:<annotated port>
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # 6) copy useful pod labels onto every series. `track` (stable|canary)
+          #    and `color` (blue|green) make canary/blue-green comparisons
+          #    possible in PromQL, e.g. ...{track="canary"}.
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(app|track|color|tier)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          # 7) job = the pod's `app` label. Series then carry the SAME job
+          #    names as in docker-compose (scalebotai-api, postgres-exporter,
+          #    redis-exporter), so the shared Grafana dashboards and alert
+          #    expressions work unchanged in both environments. Stable,
+          #    canary, blue and green pods all share app=scalebotai-api and
+          #    are told apart by the `track` / `color` labels instead.
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: (.+)
+            target_label: job
+
+      # ---------------------------------------------------------------------
+      # cAdvisor (inside every kubelet): per-container CPU, memory, network.
+      # role: node -> one target per node at <InternalIP>:10250 (kubelet).
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        metrics_path: /metrics/cadvisor
+        # Authenticate to the kubelet with Prometheus' ServiceAccount token
+        # (authorised via RBAC nodes/metrics).
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          # kubelet serving certificates are usually self-signed (minikube,
+          # kind, kubeadm defaults). Enable serverTLSBootstrap on the kubelets
+          # to get CA-signed certs and remove this line.
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+        # Keep only the series we use (cAdvisor is very verbose).
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            action: keep
+            regex: container_(cpu_usage_seconds_total|cpu_cfs_throttled_periods_total|cpu_cfs_periods_total|memory_working_set_bytes|memory_rss|spec_cpu_quota|spec_cpu_period|spec_memory_limit_bytes|network_receive_bytes_total|network_transmit_bytes_total|network_receive_packets_dropped_total|network_transmit_packets_dropped_total|fs_usage_bytes|oom_events_total|last_seen)
+
+      # ---------------------------------------------------------------------
+      # Kubelet's own metrics (PVC usage: kubelet_volume_stats_*).
+      - job_name: kubernetes-kubelet
+        scheme: https
+        metrics_path: /metrics
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+        metric_relabel_configs:
+          - source_labels: [__name__]
+            action: keep
+            regex: kubelet_(volume_stats_.*|running_pods|running_containers|pod_start_duration_seconds_.*)
+
+      # ---------------------------------------------------------------------
+      # kube-state-metrics: Kubernetes OBJECT state (restarts, HPA, rollouts).
+      # honor_labels: true keeps KSM's own `namespace`/`pod` labels (the
+      # object's namespace) instead of renaming them to exported_namespace.
+      - job_name: kube-state-metrics
+        honor_labels: true
+        static_configs:
+          - targets: ["kube-state-metrics.monitoring.svc:8080"]

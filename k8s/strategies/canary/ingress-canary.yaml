@@ -1,0 +1,71 @@
+# =============================================================================
+# Canary Ingress (ingress-nginx native canary) — Variant B
+# =============================================================================
+# ingress-nginx merges a "canary" Ingress into the PRIMARY Ingress that has
+# the SAME host + paths (scalebotai-ingress, k8s/base/08-ingress.yaml) and
+# splits traffic between the two backends inside NGINX:
+#
+#   1. Header  X-Canary: always -> ALWAYS canary   (testers, smoke tests, QA)
+#              X-Canary: never  -> NEVER canary    (pin a client to stable)
+#   2. otherwise canary-weight % of requests (random per request) -> canary
+#
+# Precedence: canary-by-header > canary-by-cookie > canary-weight.
+# Only ONE canary Ingress per host/path is supported.
+#
+# Prefer ./set-weight.sh <percent>: it also applies service-canary.yaml and
+# points the primary Ingress at the stable-only Service so the percentage is
+# exact (see service-canary.yaml). Change the weight progressively:
+#   ./set-weight.sh 10 ; ./set-weight.sh 25 ; ./set-weight.sh 50 ; ./promote.sh
+# Stop all canary traffic immediately:
+#   kubectl -n scalebotai delete ingress scalebotai-ingress-canary   (or ./abort.sh)
+#
+# Test the header route:
+#   curl -k -H "X-Canary: always" https://api.scalebotai.local/health
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scalebotai-ingress-canary
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: ingress
+    app: scalebotai-api
+    track: canary
+  annotations:
+    # Marks this Ingress as a canary of the primary with the same host/path.
+    nginx.ingress.kubernetes.io/canary: "true"
+    # Header routing: value "always" -> canary, "never" -> stable.
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+    # Percentage of the remaining traffic (0-100) sent to the canary.
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+    # Same protections as the primary Ingress.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.scalebotai.local
+      secretName: scalebotai-tls
+  rules:
+    - host: api.scalebotai.local
+      http:
+        # Must mirror the primary Ingress paths exactly.
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api-canary
+                port:
+                  name: http
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api-canary
+                port:
+                  name: http

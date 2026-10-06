@@ -1,0 +1,610 @@
+# =============================================================================
+# ScaleBotAI - Docker Compose stack (production-like local environment)
+# -----------------------------------------------------------------------------
+# Quick start (from the repository root):
+#   cp .env.example .env            # then replace every change-me-... value
+#   docker compose up -d --build    # build + start everything
+#   docker compose ps               # wait until services are (healthy)
+#
+# Optional LLM mode (Ollama + tinyllama):
+#   docker compose --profile llm up -d
+#   docker compose exec ollama ollama pull tinyllama
+#   (and set CHATBOT_MODE=llm in .env, then `docker compose up -d chatbot-api`)
+#
+# Horizontal scaling (NGINX load-balances all replicas round-robin):
+#   docker compose up -d --scale chatbot-api=3
+#
+# Dev hot-reload override:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Entry points:
+#   API (via NGINX)  https://localhost  (or https://api.scalebotai.local)  http://localhost -> 301
+#   Grafana          http://localhost:3000   (admin / GRAFANA_ADMIN_PASSWORD)
+#   Prometheus       http://localhost:9090
+#   Kibana           http://localhost:5601
+#   Elasticsearch    http://localhost:9200   (bound to 127.0.0.1 only)
+#
+# Networks (least privilege - a service joins only the networks it needs):
+#   frontend    nginx <-> chatbot-api (+ nginx-exporter, to scrape nginx:8080)
+#   backend     chatbot-api <-> postgres / redis / ollama (+ postgres/redis exporters)
+#   monitoring  prometheus, grafana, elasticsearch, logstash, kibana, exporters,
+#               chatbot-api (so Prometheus can scrape every replica's /metrics)
+#   => nginx can NOT reach postgres/redis; prometheus can NOT reach postgres directly.
+#
+# Required .env values (see .env.example): POSTGRES_PASSWORD, REDIS_PASSWORD,
+# JWT_SECRET_KEY, ADMIN_PASSWORD, GRAFANA_ADMIN_PASSWORD.
+# Optional: POSTGRES_MONITORING_PASSWORD, DOCKERHUB_USER, IMAGE_TAG, ELASTIC_VERSION,
+# MONITORING_BIND_ADDR (default 127.0.0.1 - set 0.0.0.0 to expose dashboards on the LAN).
+# =============================================================================
+
+# Project name -> prefixes containers (scalebotai-chatbot-api-1), networks
+# (scalebotai_backend) and volumes (scalebotai_postgres-data).
+name: scalebotai
+
+# -----------------------------------------------------------------------------
+# Reusable fragments. Top-level keys starting with "x-" are ignored by Compose,
+# so they are the idiomatic place for YAML anchors (&name) that services merge
+# in with "<<: *name" (a shallow merge: keys set in the service win).
+# -----------------------------------------------------------------------------
+
+# Rotate the json-file logs so `docker logs` output cannot fill the disk.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Defaults shared by every service.
+#   restart: unless-stopped -> restart after crashes and Docker/host reboots,
+#                              but not after an explicit `docker compose stop`.
+#   no-new-privileges        -> processes can never gain privileges via setuid binaries.
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  logging: *default-logging
+  security_opt:
+    - no-new-privileges:true
+
+# Healthcheck timing shared by most services (each service supplies its own "test").
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 30s
+
+services:
+  # ===========================================================================
+  # EDGE TIER
+  # ===========================================================================
+
+  # NGINX: TLS termination, HTTP->HTTPS redirect, rate limiting, load balancing
+  # across all chatbot-api replicas, JSON access logs, internal stub_status.
+  nginx:
+    <<: *service-defaults
+    build:
+      context: ./docker/nginx
+      dockerfile: Dockerfile
+    image: ${DOCKERHUB_USER:-scalebotai}/scalebotai-nginx:${IMAGE_TAG:-local}
+    ports:
+      - "80:80"       # HTTP  -> 301 redirect to HTTPS
+      - "443:443"     # HTTPS -> API
+      # 8080 (stub_status) is intentionally NOT published.
+    networks:
+      - frontend
+    # Proxy temp files live in RAM (tmpfs): fast and nothing persists.
+    tmpfs:
+      - /var/cache/nginx:size=64m
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    depends_on:
+      chatbot-api:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1"]
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+
+  # ===========================================================================
+  # APPLICATION TIER
+  # ===========================================================================
+
+  # FastAPI chatbot API. NO container_name and NO host ports, so that
+  # `docker compose up --scale chatbot-api=N` can run N identical replicas;
+  # NGINX reaches them via Docker DNS (chatbot-api -> N A records).
+  chatbot-api:
+    <<: *service-defaults
+    build:
+      context: .                          # repository ROOT
+      dockerfile: docker/api/Dockerfile
+      target: runtime
+      args:
+        VERSION: ${APP_VERSION:-1.0.0}
+        VCS_REF: ${VCS_REF:-local}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    image: ${DOCKERHUB_USER:-scalebotai}/scalebotai-api:${IMAGE_TAG:-local}
+    # All app settings + secrets come from .env (copy of .env.example) ...
+    env_file:
+      - .env
+    # ... and these values are forced for the Compose topology (they win over .env).
+    environment:
+      LOG_FILE: /var/log/scalebotai/app.log   # shared with logstash via the app-logs volume
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      OLLAMA_BASE_URL: http://ollama:11434
+    expose:
+      - "8000"                            # documentation only; reachable on Docker networks
+    volumes:
+      # Named volume: JSON log file written here is tailed by logstash (read-only there).
+      - app-logs:/var/log/scalebotai
+    # Hardening: immutable root filesystem; only /tmp (tmpfs, RAM) and the log
+    # volume are writable. No Linux capabilities needed (port 8000 > 1024, non-root).
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop:
+      - ALL
+    networks:
+      - frontend      # reached by nginx
+      - backend       # reaches postgres, redis, ollama
+      - monitoring    # scraped by prometheus (dns_sd_configs finds every replica)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=4).status == 200 else 1)"]
+      interval: 10s
+    # Time between SIGTERM and SIGKILL: lets uvicorn finish in-flight requests.
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        # Mirrors the Kubernetes requests/limits (k8s/base/06-api-deployment.yaml).
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # ===========================================================================
+  # DATA TIER
+  # ===========================================================================
+
+  # PostgreSQL 16: system of record (users, conversations, chats, feedback).
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-scalebot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set - copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:-scalebotai}
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      # Read by docker/postgres/init/01-init.sql (\getenv) for the exporter's role.
+      POSTGRES_MONITORING_PASSWORD: ${POSTGRES_MONITORING_PASSWORD:-change-me-monitoring-password}
+      # Sub-directory keeps PGDATA valid even if the volume root contains lost+found.
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: UTC
+    # Server tuning for a ~1 GB container (pgtune-style). max_connections budget:
+    # 3 replicas x (DB_POOL_SIZE 10 + DB_MAX_OVERFLOW 20) = 90, + exporter + admin
+    # sessions, leaving headroom for scaling to ~6 replicas.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - pg_stat_statements.max=10000
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - idle_in_transaction_session_timeout=60000
+    volumes:
+      - postgres-data:/var/lib/postgresql/data                # named volume: survives `down`
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro # bind mount: first-boot SQL
+    # /dev/shm is a tmpfs; the 64 MB Docker default is too small for parallel
+    # query workers ("could not resize shared memory segment").
+    shm_size: 256mb
+    networks:
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      # -h 127.0.0.1 (TCP) on purpose: during first-boot init the entrypoint runs a
+      # temporary socket-only server, so a socket check would report "ready" too early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" || exit 1"]
+      interval: 10s
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # Redis 7.4: response cache, rate-limit counters, JWT denylist, analytics cache.
+  redis:
+    <<: *service-defaults
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is not set - copy .env.example to .env}
+      - --appendonly              # AOF persistence: denylist/counters survive restarts
+      - "yes"
+      - --appendfsync
+      - everysec                  # fsync once per second (max ~1 s of writes lost)
+      - --maxmemory
+      - 256mb                     # hard cap on dataset size ...
+      - --maxmemory-policy
+      - allkeys-lru               # ... then evict least-recently-used keys (it is a cache)
+      - --tcp-keepalive
+      - "60"
+    environment:
+      # redis-cli reads the password from REDISCLI_AUTH -> healthcheck needs no -a flag.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set - copy .env.example to .env}
+    volumes:
+      - redis-data:/data
+    networks:
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 384M          # 256 MB data + headroom for AOF-rewrite fork (copy-on-write)
+        reservations:
+          memory: 64M
+
+  # Ollama: local LLM runtime for CHATBOT_MODE=llm. Only started with --profile llm.
+  # After first start:  docker compose exec ollama ollama pull tinyllama
+  ollama:
+    <<: *service-defaults
+    image: ollama/ollama:0.3.14
+    profiles: ["llm"]
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h      # keep the model loaded in RAM between requests
+      OLLAMA_NUM_PARALLEL: "2"
+    volumes:
+      - ollama-data:/root/.ollama # downloaded models (~640 MB for tinyllama) persist here
+    networks:
+      - backend
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD", "ollama", "list"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 3G
+        # NVIDIA GPU (optional, requires the NVIDIA Container Toolkit / WSL2 GPU support):
+        # reservations:
+        #   devices:
+        #     - driver: nvidia
+        #       count: all
+        #       capabilities: [gpu]
+
+  # ===========================================================================
+  # METRICS: exporters + Prometheus + Grafana
+  # ===========================================================================
+
+  # PostgreSQL metrics on :9187 (connects as the read-only "monitoring" role).
+  postgres-exporter:
+    <<: *service-defaults
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_URI: "postgres:5432/${POSTGRES_DB:-scalebotai}?sslmode=disable"
+      DATA_SOURCE_USER: monitoring
+      DATA_SOURCE_PASS: ${POSTGRES_MONITORING_PASSWORD:-change-me-monitoring-password}
+    command:
+      - --collector.stat_statements   # top queries from pg_stat_statements
+    networks:
+      - backend       # to reach postgres
+      - monitoring    # to be scraped by prometheus
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+
+  # Redis metrics on :9121.
+  redis-exporter:
+    <<: *service-defaults
+    image: oliver006/redis_exporter:v1.62.0
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is not set - copy .env.example to .env}
+    networks:
+      - backend
+      - monitoring
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+
+  # NGINX metrics on :9113, converted from stub_status at nginx:8080/nginx_status.
+  # Joins "frontend" (not nginx joining "monitoring"): the internet-facing proxy
+  # never gets a route to Prometheus/Elasticsearch/Grafana.
+  nginx-exporter:
+    <<: *service-defaults
+    image: nginx/nginx-prometheus-exporter:1.3.0
+    command:
+      - --nginx.scrape-uri=http://nginx:8080/nginx_status
+    networks:
+      - frontend
+      - monitoring
+    depends_on:
+      nginx:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+
+  # Prometheus: scrapes chatbot-api (all replicas via dns_sd_configs), exporters, itself.
+  # Config + alert rules are bind-mounted read-only from monitoring/prometheus/.
+  # Hot-reload after editing:  curl -X POST http://localhost:9090/-/reload
+  prometheus:
+    <<: *service-defaults
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-lifecycle
+      # Lets k6 push its metrics (-o experimental-prometheus-rw) for the load-test dashboard.
+      - --web.enable-remote-write-receiver
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro   # prometheus.yml + alert-rules.yml
+      - prometheus-data:/prometheus                  # TSDB (15 days)
+    ports:
+      - "${MONITORING_BIND_ADDR:-127.0.0.1}:9090:9090"
+    networks:
+      - monitoring
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/healthy || exit 1"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # Grafana: dashboards. Datasources (Prometheus uid "prometheus", Elasticsearch
+  # uid "elasticsearch") and dashboards are provisioned from monitoring/grafana/.
+  grafana:
+    <<: *service-defaults
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is not set - copy .env.example to .env}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3000
+    volumes:
+      - grafana-data:/var/lib/grafana                                    # users, prefs, sqlite DB
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro   # datasources + dashboard providers
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro   # dashboard JSON files
+    ports:
+      - "${MONITORING_BIND_ADDR:-127.0.0.1}:3000:3000"
+    networks:
+      - monitoring
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+
+  # ===========================================================================
+  # LOGGING: Elasticsearch + Logstash + Kibana (ELK)
+  # ===========================================================================
+
+  # Elasticsearch 8 single node. SECURITY DISABLED - LOCAL DEVELOPMENT ONLY:
+  # no TLS, no authentication. Never expose this configuration beyond localhost
+  # (the port below is bound to 127.0.0.1 for that reason).
+  elasticsearch:
+    <<: *service-defaults
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.15.3}
+    environment:
+      - node.name=es01
+      - cluster.name=scalebotai-logs
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - xpack.ml.enabled=false
+      - bootstrap.memory_lock=true
+      - action.destructive_requires_name=true
+      # Laptops often have >90 % full disks; don't flip indices to read-only locally.
+      - cluster.routing.allocation.disk.threshold_enabled=false
+      # Fixed 512 MB JVM heap (~50 % of the container limit; the rest is OS file cache).
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ulimits:
+      memlock:          # allow the JVM to lock its heap in RAM (no swapping)
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    networks:
+      - monitoring
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Logstash: tails the API's JSON log file from the shared app-logs volume
+  # (file input) and listens for Filebeat on 5044 (beats input, used in k8s),
+  # then writes to Elasticsearch indices scalebot-{log_type}-logs-YYYY.MM.dd.
+  logstash:
+    <<: *service-defaults
+    image: docker.elastic.co/logstash/logstash:${ELASTIC_VERSION:-8.15.3}
+    environment:
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - ./monitoring/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./monitoring/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - app-logs:/var/log/scalebotai:ro   # same volume chatbot-api writes to - READ-ONLY here
+    networks:
+      - monitoring
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9600/ >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Kibana: search/visualise logs (create a data view for "scalebot-*").
+  kibana:
+    <<: *service-defaults
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION:-8.15.3}
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      SERVER_NAME: kibana
+      SERVER_PUBLICBASEURL: http://localhost:5601
+      TELEMETRY_OPTIN: "false"
+    ports:
+      - "${MONITORING_BIND_ADDR:-127.0.0.1}:5601:5601"
+    networks:
+      - monitoring
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck-defaults
+      test: ["CMD-SHELL", "curl -s http://127.0.0.1:5601/api/status | grep -q '\"level\":\"available\"' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 512M
+
+# =============================================================================
+# NETWORKS - user-defined bridge networks. Unlike the default "bridge" network
+# they provide automatic DNS (service name -> container IPs via 127.0.0.11) and
+# are isolated from each other: containers only talk across a network they share.
+# =============================================================================
+networks:
+  frontend:
+    driver: bridge
+    labels:
+      com.scalebotai.description: "Edge traffic: nginx <-> chatbot-api"
+  backend:
+    driver: bridge
+    labels:
+      com.scalebotai.description: "Data traffic: chatbot-api <-> postgres/redis/ollama"
+  monitoring:
+    driver: bridge
+    labels:
+      com.scalebotai.description: "Observability: prometheus, grafana, ELK, exporters"
+
+# =============================================================================
+# VOLUMES - named volumes managed by Docker (stored under /var/lib/docker/volumes).
+# They survive `docker compose down`; only `docker compose down -v` deletes them.
+# =============================================================================
+volumes:
+  postgres-data:
+    labels:
+      com.scalebotai.description: "PostgreSQL data directory (PGDATA)"
+  redis-data:
+    labels:
+      com.scalebotai.description: "Redis AOF/RDB persistence"
+  es-data:
+    labels:
+      com.scalebotai.description: "Elasticsearch indices (scalebot-*-logs-*)"
+  prometheus-data:
+    labels:
+      com.scalebotai.description: "Prometheus TSDB (15d retention)"
+  grafana-data:
+    labels:
+      com.scalebotai.description: "Grafana sqlite DB, users, plugins"
+  app-logs:
+    labels:
+      com.scalebotai.description: "Shared API log file: written by chatbot-api, read by logstash"
+  ollama-data:
+    labels:
+      com.scalebotai.description: "Ollama models (tinyllama)"

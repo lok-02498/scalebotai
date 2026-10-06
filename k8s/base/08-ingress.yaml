@@ -1,0 +1,102 @@
+# =============================================================================
+# 08-ingress.yaml — public HTTPS entry point (ingress-nginx)
+# =============================================================================
+# An Ingress is a set of L7 routing rules (host + path -> Service). It does
+# nothing by itself: an Ingress CONTROLLER (here ingress-nginx, installed by
+# `minikube addons enable ingress`) watches Ingress objects and configures a
+# reverse proxy (NGINX) accordingly. The controller:
+#   * terminates TLS with the certificate in Secret scalebotai-tls
+#   * redirects HTTP -> HTTPS
+#   * rate-limits per client IP
+#   * proxies DIRECTLY to the Ready pod IPs listed in the Service's
+#     EndpointSlices (not via the ClusterIP), with keep-alive connections.
+#
+# Request path:  client -> ingress-nginx (443, TLS) -> pod:8000 (HTTP)
+#
+# Security: /metrics MUST NOT be public (docs/05-api-design.md). We do NOT use a
+# `server-snippet` deny rule because snippet annotations are disabled by
+# default since ingress-nginx v1.9 (they allowed config injection,
+# CVE-2021-25742 / CVE-2025-1974 "IngressNightmare"). Instead we ALLOW-LIST
+# only /api and /health: anything else (/metrics, /docs, ...) matches no rule
+# and gets the controller's default 404.
+#
+# Status note (2026): the community ingress-nginx project was retired
+# (maintenance ended March 2026). It is still what the minikube addon ships
+# and fine for this lab; for new production clusters migrate these rules to
+# the Gateway API (Gateway + HTTPRoute) — see docs/07, "Future work".
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scalebotai-ingress
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: ingress
+    app: scalebotai-api
+  annotations:
+    # ---- TLS -----------------------------------------------------------------
+    # 308-redirect plain HTTP to HTTPS (also when TLS is terminated upstream).
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # (HSTS is on by default in the controller's ConfigMap when TLS is used.)
+
+    # ---- Rate limiting (per client IP, enforced in NGINX before the app) ----
+    # 50 req/s steady per IP with a burst of 50 x 5 = 250 requests; excess gets
+    # HTTP 503 (status code configurable globally via `limit-req-status-code`).
+    # The app adds its own per-user limit (RATE_LIMIT_PER_MINUTE) on top.
+    # LOAD TESTS from one machine will hit this: allow-list the generator:
+    #   nginx.ingress.kubernetes.io/limit-whitelist: "192.168.49.1/32"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+
+    # ---- Timeouts (seconds) --------------------------------------------------
+    # connect: fail fast to the next pod if one is unreachable.
+    # read/send: 60 s covers the slowest path (LLM mode, OLLAMA_TIMEOUT_SECONDS=20).
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+
+    # ---- Retries during rollouts / pod failures -----------------------------
+    # Retry on another pod if the chosen one refuses the connection or returns
+    # 502/503/504 — smooths over a pod that is shutting down. NGINX never
+    # retries non-idempotent requests (POST/PATCH) once they were sent.
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "error timeout http_502 http_503 http_504"
+    nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
+
+    # ---- Request size ------------------------------------------------------
+    # Chat messages are <= 2000 chars; 1 MiB is generous and blocks huge bodies.
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+
+    # cert-manager alternative (k8s/tls/cert-manager-issuer.yaml):
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  # Which controller implements this Ingress (IngressClass "nginx").
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.scalebotai.local
+      # kubernetes.io/tls Secret with tls.crt + tls.key, created by
+      # k8s/tls/create-tls-secret.sh (self-signed) or by cert-manager.
+      secretName: scalebotai-tls
+  rules:
+    - host: api.scalebotai.local
+      http:
+        paths:
+          # Prefix /api matches /api, /api/v1/auth/login, /api/v1/chat, ...
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api
+                port:
+                  name: http
+          # Prefix /health matches /health, /health/live, /health/ready
+          # (used by scripts/smoke_test.sh and external uptime monitors).
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api
+                port:
+                  name: http

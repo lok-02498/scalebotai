@@ -1,0 +1,245 @@
+# =============================================================================
+# 03-storage.yaml — persistent storage for PostgreSQL and Redis
+# =============================================================================
+# Three objects work together (viva favourite):
+#
+#   StorageClass (SC)          "what KIND of disk and who creates it"
+#   PersistentVolume (PV)      "an actual piece of storage" (cluster-scoped)
+#   PersistentVolumeClaim (PVC) "a pod's REQUEST for storage" (namespaced)
+#
+# Pods never reference a PV directly; they mount a PVC, and the control plane
+# BINDS the PVC to a PV that satisfies size + accessMode + storageClassName.
+# Lifecycle:  Available -> Bound -> (PVC deleted) -> Released -> reclaimed
+# according to persistentVolumeReclaimPolicy (Retain / Delete).
+#
+# Static vs dynamic provisioning
+# ------------------------------
+# * STATIC (this file, for the minikube/kind lab): an admin pre-creates PVs
+#   (hostPath = a directory on the node) and PVCs bind to them.
+# * DYNAMIC (cloud / production): no PV objects are written by hand. A PVC
+#   names a StorageClass whose provisioner (a CSI driver) creates the disk on
+#   demand. Example for AWS EKS (EBS gp3):
+#
+#     apiVersion: storage.k8s.io/v1
+#     kind: StorageClass
+#     metadata:
+#       name: gp3
+#     provisioner: ebs.csi.aws.com
+#     parameters:
+#       type: gp3
+#       encrypted: "true"
+#     reclaimPolicy: Retain               # keep the disk if the PVC is deleted
+#     allowVolumeExpansion: true          # kubectl edit pvc -> bigger size
+#     volumeBindingMode: WaitForFirstConsumer   # create the disk in the AZ
+#                                               # where the pod is scheduled
+#   GKE equivalent: provisioner pd.csi.storage.gke.io, parameters.type: pd-ssd.
+#   Then the PVCs below would only change `storageClassName: gp3` and drop
+#   `volumeName`.
+#
+# hostPath caveats (why it is LAB ONLY)
+# -------------------------------------
+# * Data lives on ONE node; if the pod moves to another node it sees an empty
+#   directory. Real clusters use network/CSI disks (or `local` PVs with
+#   nodeAffinity).
+# * hostPath directories are created root:root 0755 by the kubelet and
+#   `fsGroup` is NOT applied to hostPath volumes. Our database containers run
+#   as non-root (postgres uid 70, redis uid 999) because the namespace
+#   enforces the "restricted" Pod Security level, and a restricted pod cannot
+#   chown anything. So the LAB-ONLY Job at the end of this file (namespace
+#   kube-system, which has no Pod Security enforcement) creates the
+#   directories and hands them to the right uids once. Postgres/Redis wait in
+#   an init container until their volume is writable.
+#   Manual equivalent (if your cluster forbids that Job):
+#
+#     minikube ssh -- "sudo mkdir -p /data/scalebotai/postgres /data/scalebotai/redis && \
+#       sudo chown -R 70:70 /data/scalebotai/postgres && \
+#       sudo chown -R 999:1000 /data/scalebotai/redis"
+#
+#   (kind: `docker exec kind-control-plane sh -c "<same commands without sudo>"`)
+#   minikube persists /data across `minikube stop/start`.
+#   With cloud CSI volumes none of this is needed (fsGroup works there):
+#   delete the PVs, the StorageClass and the Job from this file.
+# =============================================================================
+
+# ---- StorageClass "manual" --------------------------------------------------
+# kubernetes.io/no-provisioner = "nothing creates disks automatically; only
+# pre-created PVs with this class can be bound". It documents intent and makes
+# sure these PVCs never accidentally get a dynamically provisioned disk from
+# the cluster's default class (minikube's default is "standard").
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: manual
+  annotations:
+    # Never make this the default class.
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+# Immediate = bind PVC to PV as soon as both exist (fine for a single-node
+# lab). Multi-node clusters with node-local disks should use
+# WaitForFirstConsumer so binding waits until the pod is scheduled.
+volumeBindingMode: Immediate
+---
+# ---- PersistentVolume for PostgreSQL ----------------------------------------
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: postgres-pv
+  labels:
+    app.kubernetes.io/name: postgres
+    volume: postgres
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 5Gi
+  # RWO = mountable read-write by ONE node at a time — correct for a database.
+  # (RWX = many nodes, needs NFS/CephFS/EFS; ROX = read-only many;
+  #  RWOP = ReadWriteOncePod, exactly one pod.)
+  accessModes:
+    - ReadWriteOnce
+  # Retain: deleting the PVC keeps the data (PV goes to "Released"). An admin
+  # must clean it up manually — the safe choice for databases. (Delete would
+  # erase the backing disk together with the PVC.)
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  hostPath:
+    path: /data/scalebotai/postgres
+    # DirectoryOrCreate: create the directory (root:root 0755) if missing.
+    # See the chown note in the header.
+    type: DirectoryOrCreate
+  # Multi-node clusters: pin a hostPath/local PV to the node that holds it:
+  # nodeAffinity:
+  #   required:
+  #     nodeSelectorTerms:
+  #       - matchExpressions:
+  #           - key: kubernetes.io/hostname
+  #             operator: In
+  #             values: ["minikube"]
+---
+# ---- PersistentVolume for Redis (AOF persistence) ---------------------------
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: redis-pv
+  labels:
+    app.kubernetes.io/name: redis
+    volume: redis
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  hostPath:
+    path: /data/scalebotai/redis
+    type: DirectoryOrCreate
+---
+# ---- PersistentVolumeClaim used by the postgres StatefulSet -----------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # volumeName PRE-BINDS this claim to exactly this PV. Without it the binder
+  # picks any Available PV with the same class whose size >= request, so the
+  # postgres claim could grab redis-pv (or vice versa) by accident.
+  volumeName: postgres-pv
+---
+# ---- PersistentVolumeClaim used by the redis Deployment ---------------------
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  volumeName: redis-pv
+---
+# ---- LAB ONLY: prepare the hostPath directories (runs once) -----------------
+# Why a Job in kube-system? The scalebotai namespace enforces the "restricted"
+# Pod Security level (non-root only), but only root can chown a root-owned
+# directory on the node. kube-system carries no Pod Security labels, so this
+# one-shot node-preparation task runs there instead of weakening the app
+# namespace. It is still tightly scoped:
+#   * mounts ONLY /data/scalebotai (not the whole host filesystem)
+#   * not privileged, no privilege escalation, read-only root FS
+#   * all capabilities dropped except CHOWN + FOWNER (needed for chown/chmod)
+# Idempotent: re-running just re-applies the same owners/modes. The finished
+# Job deletes itself after an hour (ttlSecondsAfterFinished); the ownership
+# stays on disk. Single-node clusters only (hostPath lives on ONE node).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scalebotai-hostpath-permissions
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: scalebotai-hostpath-permissions
+    app.kubernetes.io/component: lab-storage-setup
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalebotai-hostpath-permissions
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prepare
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /host/postgres /host/redis
+              chmod 0700 /host/postgres && chown 70:70 /host/postgres       # postgres (alpine) uid:gid
+              chmod 0750 /host/redis    && chown 999:1000 /host/redis      # redis (alpine) uid:gid
+              ls -ln /host
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          volumeMounts:
+            - name: host-data
+              mountPath: /host
+      volumes:
+        - name: host-data
+          hostPath:
+            path: /data/scalebotai
+            type: DirectoryOrCreate

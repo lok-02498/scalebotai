@@ -1,0 +1,48 @@
+# =============================================================================
+# Rolling-update tuning patch for deployment/scalebotai-api
+# =============================================================================
+# The base Deployment (k8s/base/06-api-deployment.yaml) ALREADY uses these
+# values; this file exists to (re)apply or experiment with the rollout knobs
+# without editing the base, e.g.:
+#
+#   kubectl -n scalebotai patch deployment scalebotai-api \
+#     --type strategic --patch-file k8s/strategies/rolling-update/deployment-patch.yaml
+#
+# or as a kustomize overlay patch:
+#   patches:
+#     - path: ../strategies/rolling-update/deployment-patch.yaml
+#
+# Changing only spec.strategy / minReadySeconds / progressDeadlineSeconds
+# does NOT restart pods (they are not part of the pod template).
+#
+# How the numbers produce ZERO downtime with replicas=3:
+#   maxSurge 25%       -> ceil(3 x 0.25) = 1 extra pod allowed  (max 4 pods)
+#   maxUnavailable 0   -> floor(3 x 0)   = 0 -> always >= 3 Ready pods
+#   step 1: create 1 new pod (4 total) ........ wait Ready + minReadySeconds
+#   step 2: terminate 1 old pod (3) ........... preStop sleep drains it
+#   step 3: create next new pod (4) ... repeat until 3 new / 0 old
+# Capacity never drops below 100%; the cost is one extra pod during rollout.
+#
+# Trade-offs to discuss:
+#   maxSurge 100%, maxUnavailable 0  -> fastest, needs 2x capacity briefly
+#   maxSurge 0,    maxUnavailable 1  -> no extra capacity, but runs at 2/3
+#   maxUnavailable 0 + maxSurge 0    -> INVALID (no progress possible)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalebotai-api
+  namespace: scalebotai
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  # New pod must be Ready for 10 s before it counts as available.
+  minReadySeconds: 10
+  # Mark the rollout failed after 10 minutes without progress
+  # (`kubectl rollout status` then exits non-zero -> Jenkins rolls back).
+  progressDeadlineSeconds: 600
+  # ReplicaSets kept for `kubectl rollout undo --to-revision=N`.
+  revisionHistoryLimit: 10

@@ -1,0 +1,45 @@
+# =============================================================================
+# 07-api-service.yaml — stable virtual IP + DNS name in front of the API pods
+# =============================================================================
+# Pods are ephemeral (new IPs on every restart/rollout). A Service gives a
+# STABLE name (scalebotai-api.scalebotai.svc.cluster.local) and virtual IP,
+# and load-balances across all READY pods whose labels match the selector.
+# The EndpointSlice controller keeps the backend list up to date; only pods
+# passing their readinessProbe are included.
+#
+# Selector is ONLY `app: scalebotai-api`. Consequences:
+#   * stable pods (track: stable) AND canary pods (track: canary) are both
+#     selected -> 3 stable + 1 canary pod = ~25% canary traffic
+#     (k8s/strategies/canary).
+#   * In blue-green mode the public Ingress points at scalebotai-api-active
+#     instead (k8s/strategies/blue-green) — never run both modes behind THIS
+#     Service at the same time.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalebotai-api
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app: scalebotai-api
+    tier: backend
+spec:
+  # ClusterIP = reachable only inside the cluster. External traffic enters
+  # through the Ingress controller (08-ingress.yaml), which terminates TLS.
+  # (NodePort / LoadBalancer would expose the pods directly — not wanted.)
+  type: ClusterIP
+  selector:
+    app: scalebotai-api
+  # None = every request may go to any pod. The API is stateless (JWT auth,
+  # state in Postgres/Redis), so no sticky sessions are needed — this is what
+  # makes horizontal scaling trivial.
+  sessionAffinity: None
+  ports:
+    - name: http            # referenced by the Ingress backend (port.name: http)
+      port: 80              # Service port (what clients connect to)
+      targetPort: http      # container port NAME -> 8000; survives port changes
+      protocol: TCP
+      appProtocol: http

@@ -1,0 +1,194 @@
+# =============================================================================
+# Elasticsearch 8.15 — single-node log store (namespace logging)
+# =============================================================================
+# StatefulSet + volumeClaimTemplates: each ES pod gets its own PVC
+# (data-elasticsearch-0) that follows it across restarts/rescheduling.
+#
+# LAB SETTINGS — DO NOT USE AS-IS IN PRODUCTION:
+#   * discovery.type=single-node: no cluster, no replicas -> indices are
+#     "yellow"/green-without-redundancy; a lost PVC = lost logs.
+#   * xpack.security.enabled=false: no TLS, no authentication. Anyone who can
+#     reach port 9200 inside the cluster can read/delete logs. Production:
+#     enable security (TLS + users/API keys) or use ECK (Elastic Cloud on
+#     Kubernetes operator) / a managed service, 3 master-eligible nodes, ILM.
+#
+# Access:  kubectl -n logging port-forward svc/elasticsearch 9200:9200
+#          curl 'http://localhost:9200/_cat/indices/scalebot-*?v'
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch-headless
+  namespace: logging
+  labels:
+    app: elasticsearch
+    app.kubernetes.io/name: elasticsearch
+spec:
+  clusterIP: None            # per-pod DNS: elasticsearch-0.elasticsearch-headless
+  publishNotReadyAddresses: true
+  selector:
+    app: elasticsearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: http
+    - name: transport
+      port: 9300
+      targetPort: transport
+---
+# Client-facing Service used by Logstash, Kibana and Grafana:
+#   http://elasticsearch.logging.svc:9200
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: logging
+  labels:
+    app: elasticsearch
+    app.kubernetes.io/name: elasticsearch
+spec:
+  type: ClusterIP
+  selector:
+    app: elasticsearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: logging
+  labels:
+    app: elasticsearch
+    app.kubernetes.io/name: elasticsearch
+    app.kubernetes.io/component: log-storage
+    app.kubernetes.io/version: "8.15.3"
+spec:
+  serviceName: elasticsearch-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        app.kubernetes.io/name: elasticsearch
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 1000          # PVC writable by the elasticsearch user
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # ---------------------------------------------------------------------
+        # WHY PRIVILEGED: Elasticsearch memory-maps index files and refuses to
+        # start in production mode unless the kernel allows >= 262144 memory
+        # map areas per process (bootstrap check "max virtual memory areas
+        # vm.max_map_count [65530] is too low"). vm.max_map_count is a
+        # NODE-WIDE kernel parameter, not namespaced, so it can only be changed
+        # from a privileged container running as root. The container runs one
+        # command and exits; ES itself runs unprivileged as uid 1000.
+        # This is the reason the `logging` namespace enforces "privileged".
+        # Alternatives: set it on the nodes (sysctl.d / node image / a
+        # dedicated DaemonSet), or set node.store.allow_mmap=false in ES.
+        # ---------------------------------------------------------------------
+        - name: sysctl-max-map-count
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command: ["sysctl", "-w", "vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsNonRoot: false
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+          imagePullPolicy: IfNotPresent
+          env:
+            # Elasticsearch accepts settings as env vars with dots.
+            - name: cluster.name
+              value: scalebotai-logs
+            - name: node.name
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: discovery.type
+              value: single-node
+            - name: xpack.security.enabled        # LAB ONLY (see header)
+              value: "false"
+            - name: xpack.ml.enabled              # save memory; ML not needed for logs
+              value: "false"
+            # Lab clusters often run on small disks: don't flip indices to
+            # read-only at the 95% flood-stage watermark. REMOVE in production.
+            - name: cluster.routing.allocation.disk.threshold_enabled
+              value: "false"
+            # JVM heap: half of the memory limit; Xms = Xmx avoids resize pauses.
+            - name: ES_JAVA_OPTS
+              value: "-Xms1g -Xmx1g"
+          ports:
+            - name: http
+              containerPort: 9200
+            - name: transport
+              containerPort: 9300
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          # JVM start + index recovery can take minutes.
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            # local=true: answer from this node's state; 200 for green/yellow.
+            httpGet:
+              path: /_cluster/health?local=true
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000        # elasticsearch user in the official image
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+  # One PVC per replica, created automatically: data-elasticsearch-0.
+  # Uses the default StorageClass (dynamic provisioning).
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: elasticsearch
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

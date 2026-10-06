@@ -1,0 +1,61 @@
+# =============================================================================
+# Canary Services for the ingress-nginx weighted variant (Variant B)
+# =============================================================================
+# scalebotai-api-canary -> ONLY canary pods   (track: canary)
+#     backend of the canary Ingress (ingress-canary.yaml)
+# scalebotai-api-stable -> ONLY stable pods   (track: stable)
+#     set-weight.sh points the primary Ingress here while a weighted canary
+#     runs. Why: the normal Service scalebotai-api selects app: scalebotai-api,
+#     which INCLUDES the canary pod. Without a stable-only backend the canary
+#     would get its ingress weight PLUS its share of the primary pool:
+#        effective = w + (1 - w) x canaryPods / allPods
+#        e.g. w = 10%, 1 of 4 pods  ->  10% + 90% x 25% = 32.5%  (not 10%!)
+#     With the primary on scalebotai-api-stable the canary gets exactly w.
+# promote.sh / abort.sh point the primary Ingress back to scalebotai-api and
+# delete both Services.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalebotai-api-canary
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app: scalebotai-api
+    track: canary
+spec:
+  type: ClusterIP
+  selector:
+    app: scalebotai-api
+    track: canary
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalebotai-api-stable
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app: scalebotai-api
+    track: stable
+spec:
+  type: ClusterIP
+  selector:
+    app: scalebotai-api
+    track: stable
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+      appProtocol: http

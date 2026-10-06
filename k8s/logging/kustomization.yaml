@@ -1,0 +1,31 @@
+# =============================================================================
+# k8s/logging — Elasticsearch + Logstash + Kibana + Filebeat (ELK with Beats)
+# =============================================================================
+#   kubectl apply -k k8s/logging
+#   kubectl -n logging get pods -w        # ES ~1-2 min, Kibana ~2-3 min
+#   kubectl -n logging port-forward svc/kibana 5601:5601
+#
+# Resource note: this stack requests ~3.7 GiB RAM (ES 2Gi, Logstash 768Mi,
+# Kibana 768Mi, Filebeat 100Mi). On an 8 GiB minikube run it together with
+# k8s/base + k8s/monitoring only if nothing else is running; otherwise start
+# minikube with --memory 12g or deploy logging on its own for the demo.
+#
+# kibana-ingress.yaml is intentionally NOT listed (see that file).
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - elasticsearch.yaml
+  - logstash.yaml
+  - kibana.yaml
+  - filebeat.yaml
+  # - kibana-ingress.yaml   # optional, needs basic-auth secret + TLS secret
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: scalebotai
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+    includeTemplates: false

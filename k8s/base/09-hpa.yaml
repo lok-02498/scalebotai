@@ -1,0 +1,89 @@
+# =============================================================================
+# 09-hpa.yaml — Horizontal Pod Autoscaler for the API
+# =============================================================================
+# The HPA controller (in kube-controller-manager) runs every 15 s:
+#   1. reads per-pod CPU/memory usage from the Resource Metrics API
+#      (metrics.k8s.io) — served by METRICS-SERVER, which scrapes kubelets.
+#      No metrics-server => HPA shows <unknown> and never scales.
+#      (minikube: `minikube addons enable metrics-server`)
+#   2. utilisation = average usage / average REQUEST of the selected pods
+#   3. per metric: desired = ceil( currentReplicas * currentUtil / targetUtil )
+#      (no change if the ratio is within the 10% tolerance)
+#   4. takes the MAXIMUM over all metrics, clamps to [minReplicas,maxReplicas]
+#   5. rate-limits the change with `behavior` and patches the Deployment's
+#      scale subresource.
+#
+# Worked example: 3 pods, CPU request 250m, each using 350m => 140%.
+#   desired(cpu) = ceil(3 * 140 / 70) = 6;  memory at 60% -> ceil(3*60/75) = 3
+#   max(6, 3) = 6 -> scaleUp policies allow max(+100% = 6, +4 pods = 7) -> 6 pods.
+#
+# Only pods matched by the Deployment's selector count (app=scalebotai-api,
+# track=stable) — the fixed-size canary is NOT autoscaled.
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: scalebotai-api
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: autoscaler
+    app: scalebotai-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: scalebotai-api
+  # Never fewer than 3 (HA + PDB minAvailable 2), never more than 20
+  # (protects Postgres connections: 20 pods x 8 = 160 max, see 01-configmap).
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    # CPU is the primary signal for a request/response API: more requests per
+    # second => more CPU. 70% leaves 30% headroom for the ~15-60 s it takes to
+    # detect load + start new pods.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory catches leaks / large in-flight payloads. Python rarely returns
+    # memory to the OS, so memory alone is a poor scale-DOWN signal — combined
+    # with CPU the HPA uses whichever metric demands MORE replicas.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    # ---- Scale UP fast: react to traffic spikes immediately ----------------
+    scaleUp:
+      # 0 = act on the latest recommendation, no waiting.
+      stabilizationWindowSeconds: 0
+      # Max = use the policy that allows the BIGGEST change.
+      selectPolicy: Max
+      policies:
+        # double the pod count every 15 s ...
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        # ... or add 4 pods every 15 s (whichever is larger; matters when
+        # the current count is small: 3 -> 7 instead of 3 -> 6).
+        - type: Pods
+          value: 4
+          periodSeconds: 15
+    # ---- Scale DOWN slowly: avoid flapping ------------------------------------
+    scaleDown:
+      # Use the HIGHEST recommendation seen in the last 5 minutes, so a short
+      # lull between bursts does not remove pods we will need again.
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        # remove ~10% of the pods per minute. The controller computes
+        # floor(replicas x 0.9), so with <= 10 pods that is exactly one pod
+        # per minute (20 pods -> 18 -> 16 ...).
+        - type: Percent
+          value: 10
+          periodSeconds: 60

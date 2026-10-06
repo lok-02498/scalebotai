@@ -1,0 +1,37 @@
+# =============================================================================
+# Blue-green: the PREVIEW Service (always points at the IDLE colour)
+# =============================================================================
+# Used to smoke-test a release on the idle environment BEFORE users see it:
+#   kubectl -n scalebotai port-forward svc/scalebotai-api-preview 8080:80
+#   ./scripts/smoke_test.sh http://localhost:8080
+# or through the preview host in ingress-blue-green.yaml
+#   (https://preview.api.scalebotai.local, private networks only).
+#
+# switch.sh keeps active and preview complementary: after switching active to
+# green, preview is moved to blue (the previous version), so the "rollback
+# target" is always reachable and testable.
+#
+# Initial state: green is idle (preview).
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalebotai-api-preview
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app: scalebotai-api
+    role: preview
+spec:
+  type: ClusterIP
+  selector:
+    app: scalebotai-api
+    color: green
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+      appProtocol: http

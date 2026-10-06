@@ -1,0 +1,20 @@
+# =============================================================================
+# ScaleBotAI - Grafana dashboard provisioning
+# Mounted at /etc/grafana/provisioning/dashboards/dashboards.yml.
+# Grafana loads every *.json found in /var/lib/grafana/dashboards
+# (compose mounts monitoring/grafana/dashboards there) into the "ScaleBotAI" folder.
+# =============================================================================
+apiVersion: 1
+
+providers:
+  - name: scalebotai
+    orgId: 1
+    folder: ScaleBotAI
+    folderUid: scalebotai
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true          # edits in the UI are allowed but are NOT written back to git
+    updateIntervalSeconds: 30     # pick up JSON changes without restarting Grafana
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

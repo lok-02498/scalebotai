@@ -1,0 +1,22 @@
+# CODEOWNERS - reviewers requested automatically for matching paths.
+# Later rules override earlier ones. Replace the placeholder teams/handles with real
+# GitHub users or teams before enabling "Require review from Code Owners" on main.
+
+*                   @scalebotai/maintainers
+
+/src/               @scalebotai/backend
+/tests/             @scalebotai/backend
+/pyproject.toml     @scalebotai/backend
+/requirements*.txt  @scalebotai/backend
+
+/docker/            @scalebotai/devops
+/docker-compose.yml @scalebotai/devops
+/k8s/               @scalebotai/devops
+/jenkins/           @scalebotai/devops
+/scripts/           @scalebotai/devops
+/.github/           @scalebotai/devops
+
+/monitoring/        @scalebotai/sre
+/tests/load/        @scalebotai/sre
+
+/docs/              @scalebotai/maintainers

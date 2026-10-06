@@ -1,0 +1,130 @@
+# =============================================================================
+# k8s/optional/redis-exporter.yaml — Redis metrics for Prometheus
+# =============================================================================
+#   kubectl apply -f k8s/optional/redis-exporter.yaml
+#
+# Runs INFO/CONFIG commands against Redis and exposes :9121/metrics, e.g.
+#   redis_up, redis_connected_clients, redis_memory_used_bytes,
+#   redis_keyspace_hits_total / redis_keyspace_misses_total (cache hit ratio),
+#   redis_evicted_keys_total (maxmemory pressure), redis_commands_processed_total
+# Discovered by Prometheus via the prometheus.io/* pod annotations.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-exporter
+  namespace: scalebotai
+  labels:
+    app: redis-exporter
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: redis-exporter
+  ports:
+    - name: metrics
+      port: 9121
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-exporter
+  namespace: scalebotai
+  labels:
+    app: redis-exporter
+    app.kubernetes.io/name: redis-exporter
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-exporter
+  template:
+    metadata:
+      labels:
+        app: redis-exporter
+        app.kubernetes.io/name: redis-exporter
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: metrics
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 59000     # uid used by the oliver006/redis_exporter image
+        runAsGroup: 59000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis-exporter
+          image: oliver006/redis_exporter:v1.66.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9121
+          env:
+            - name: REDIS_ADDR
+              value: "redis://redis:6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: scalebotai-secrets, key: REDIS_PASSWORD}
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-exporter
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: redis-exporter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9121
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379

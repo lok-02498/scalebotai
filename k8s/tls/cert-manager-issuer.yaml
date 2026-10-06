@@ -1,0 +1,78 @@
+# =============================================================================
+# k8s/tls/cert-manager-issuer.yaml — automatic, trusted certificates (production)
+# =============================================================================
+# cert-manager is a Kubernetes controller that requests certificates from an
+# ACME CA (Let's Encrypt), stores them in a kubernetes.io/tls Secret and
+# RENEWS them automatically (~30 days before expiry, LE certs live 90 days).
+#
+# Prerequisites
+#   1. Install cert-manager (once per cluster):
+#        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+#   2. A REAL public DNS name pointing at the ingress controller's public IP.
+#      Let's Encrypt cannot issue for *.local names — replace
+#      api.scalebotai.example.com and the e-mail below with your own.
+#   3. Port 80 reachable from the internet (HTTP-01 challenge).
+#
+# How HTTP-01 works: cert-manager creates a temporary Ingress serving
+#   http://<host>/.well-known/acme-challenge/<token>; Let's Encrypt fetches
+# it to prove you control the domain, then signs the certificate.
+#
+# Use the STAGING issuer first (high rate limits, untrusted cert) and switch
+# to PROD once it works — prod has strict rate limits (e.g. 5 duplicate certs/week).
+#
+# Two ways to get the certificate:
+#   a) Annotate the Ingress:  cert-manager.io/cluster-issuer: letsencrypt-prod
+#      (ingress-shim creates the Certificate automatically from spec.tls), or
+#   b) Apply the explicit Certificate object at the bottom of this file.
+# =============================================================================
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: change-me@example.com          # expiry notices
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key   # ACME account key (auto-created)
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: change-me@example.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx
+---
+# Explicit Certificate -> writes Secret `scalebotai-tls` (the name the Ingress
+# already uses), so switching from self-signed to Let's Encrypt needs no
+# Ingress change except the host name.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: scalebotai-tls
+  namespace: scalebotai
+spec:
+  secretName: scalebotai-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-staging        # -> letsencrypt-prod when verified
+  dnsNames:
+    - api.scalebotai.example.com     # CHANGE ME (must resolve publicly)
+  duration: 2160h                    # 90 days
+  renewBefore: 720h                  # renew 30 days before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always           # new key on every renewal

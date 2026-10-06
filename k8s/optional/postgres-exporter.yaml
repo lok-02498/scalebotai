@@ -1,0 +1,153 @@
+# =============================================================================
+# k8s/optional/postgres-exporter.yaml — PostgreSQL metrics for Prometheus
+# =============================================================================
+#   kubectl apply -f k8s/optional/postgres-exporter.yaml
+#
+# Postgres does not speak the Prometheus format. The exporter connects as a
+# client, runs statistics queries (pg_stat_database, pg_stat_activity, locks,
+# replication ...) and serves them on :9187/metrics, e.g.
+#   pg_up, pg_stat_database_numbackends, pg_stat_database_xact_commit,
+#   pg_stat_activity_count, pg_database_size_bytes
+# Prometheus finds it through the prometheus.io/* pod annotations
+# (job "kubernetes-pods" in k8s/monitoring/prometheus-config.yaml).
+#
+# Least privilege tip: in production create a dedicated monitoring role
+# (GRANT pg_monitor TO exporter) instead of reusing the application user.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter
+  namespace: scalebotai
+  labels:
+    app: postgres-exporter
+    app.kubernetes.io/name: postgres-exporter
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres-exporter
+  ports:
+    - name: metrics
+      port: 9187
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  namespace: scalebotai
+  labels:
+    app: postgres-exporter
+    app.kubernetes.io/name: postgres-exporter
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter
+        app.kubernetes.io/name: postgres-exporter
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: metrics
+      annotations:
+        # Scrape annotations live on the POD template (pod-level discovery).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/path: "/metrics"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        # Image declares USER "nobody" (non-numeric) — kubelet can only verify
+        # runAsNonRoot with a NUMERIC uid, so set it explicitly.
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9187
+          env:
+            # Defined first so $(VAR) can be expanded in DATA_SOURCE_URI below.
+            - name: POSTGRES_HOST
+              valueFrom:
+                configMapKeyRef: {name: scalebotai-config, key: POSTGRES_HOST}
+            - name: POSTGRES_PORT
+              valueFrom:
+                configMapKeyRef: {name: scalebotai-config, key: POSTGRES_PORT}
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef: {name: scalebotai-config, key: POSTGRES_DB}
+            - name: DATA_SOURCE_URI
+              value: "$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode=disable"
+            - name: DATA_SOURCE_USER
+              valueFrom:
+                secretKeyRef: {name: scalebotai-secrets, key: POSTGRES_USER}
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef: {name: scalebotai-secrets, key: POSTGRES_PASSWORD}
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /
+              port: metrics
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+---
+# Network rules for the exporter (base policy already lets it INTO postgres).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-exporter
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres-exporter
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Prometheus (monitoring namespace) scrapes :9187.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9187
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432

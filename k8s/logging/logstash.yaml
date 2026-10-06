@@ -1,0 +1,180 @@
+# =============================================================================
+# Logstash 8.15 — receives logs from Filebeat, parses them, writes to ES
+# =============================================================================
+# Flow:  API pod stdout (JSON line)
+#          -> container runtime file /var/log/containers/*scalebotai-api*.log
+#          -> Filebeat DaemonSet (adds kubernetes.* metadata)
+#          -> Logstash :5044 (beats protocol)  [this file]
+#          -> Elasticsearch index scalebot-<log_type>-logs-YYYY.MM.dd
+#          -> Kibana / Grafana
+#
+# The docker-compose pipeline (monitoring/logstash/pipeline/logstash.conf)
+# has an extra `file` input; this Kubernetes variant only needs `beats`.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logstash-pipeline
+  namespace: logging
+  labels:
+    app.kubernetes.io/name: logstash
+data:
+  logstash.conf: |
+    input {
+      # Filebeat (k8s/logging/filebeat.yaml) ships here.
+      beats {
+        port => 5044
+      }
+    }
+
+    filter {
+      # Filebeat's `container` parser already stripped the CRI/Docker wrapper,
+      # so [message] is exactly one JSON object written by the API
+      # (log fields, docs/09-monitoring-logging.md: @timestamp, level, logger, message, service,
+      #  environment, hostname, log_type, request_id, ...).
+      if [message] =~ /^\s*\{/ {
+        json {
+          source => "message"
+          # No `target`: the app's keys land at the event root. The app's own
+          # `message` replaces the raw line and its `@timestamp` becomes the
+          # event time (the json filter parses it automatically).
+          skip_on_invalid_json => true
+        }
+      }
+
+      # Guarantee a sane log_type so the index name is always valid and the
+      # number of indices stays bounded (api | user | error | system).
+      if ![log_type] {
+        mutate {
+          add_field => { "log_type" => "system" }
+          add_tag   => ["missing_log_type"]
+        }
+      }
+      mutate { lowercase => ["log_type"] }
+      if [log_type] not in ["api", "user", "error", "system"] {
+        mutate {
+          replace => { "log_type" => "system" }
+          add_tag => ["unknown_log_type"]
+        }
+      }
+
+      # Drop Beats bookkeeping fields we never query.
+      mutate {
+        remove_field => ["agent", "ecs", "input", "[log][offset]"]
+      }
+    }
+
+    output {
+      elasticsearch {
+        hosts => ["http://elasticsearch.logging.svc:9200"]
+        # e.g. scalebot-api-logs-2026.10.06, scalebot-error-logs-2026.10.06
+        index => "scalebot-%{[log_type]}-logs-%{+YYYY.MM.dd}"
+        # Plain daily indices (not data streams / ILM rollover aliases), so
+        # the explicit index name above is honoured.
+        data_stream => false
+        ilm_enabled => false
+        manage_template => false
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logstash
+  namespace: logging
+  labels:
+    app: logstash
+    app.kubernetes.io/name: logstash
+    app.kubernetes.io/component: log-processing
+    app.kubernetes.io/version: "8.15.3"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logstash
+  template:
+    metadata:
+      labels:
+        app: logstash
+        app.kubernetes.io/name: logstash
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000          # logstash user in the official image
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: logstash
+          image: docker.elastic.co/logstash/logstash:8.15.3
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: LS_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+            # Legacy self-monitoring would try to reach http://elasticsearch:9200.
+            - name: XPACK_MONITORING_ENABLED
+              value: "false"
+          ports:
+            - name: beats
+              containerPort: 5044
+            - name: api
+              containerPort: 9600
+          resources:
+            requests:
+              cpu: 250m
+              memory: 768Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # The beats port only opens once the pipeline is running.
+          startupProbe:
+            tcpSocket:
+              port: beats
+            periodSeconds: 10
+            failureThreshold: 18
+          readinessProbe:
+            tcpSocket:
+              port: beats
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: beats
+            periodSeconds: 20
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Replaces the image's default pipeline directory.
+            - name: pipeline
+              mountPath: /usr/share/logstash/pipeline
+              readOnly: true
+      volumes:
+        - name: pipeline
+          configMap:
+            name: logstash-pipeline
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logstash
+  namespace: logging
+  labels:
+    app: logstash
+    app.kubernetes.io/name: logstash
+spec:
+  type: ClusterIP
+  selector:
+    app: logstash
+  ports:
+    - name: beats
+      port: 5044
+      targetPort: beats
+    - name: api
+      port: 9600
+      targetPort: api

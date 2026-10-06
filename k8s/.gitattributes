@@ -1,0 +1,7 @@
+# Keep Linux line endings for everything under k8s/ even when the repo is
+# checked out on Windows (core.autocrlf=true would otherwise turn *.sh into
+# CRLF and break `#!/usr/bin/env bash` with "bad interpreter: ^M").
+*.sh    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf

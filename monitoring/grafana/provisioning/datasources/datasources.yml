@@ -1,0 +1,40 @@
+# =============================================================================
+# ScaleBotAI - Grafana datasource provisioning
+# Mounted at /etc/grafana/provisioning/datasources/datasources.yml.
+# The fixed UIDs (`prometheus`, `elasticsearch`) are referenced by every
+# dashboard JSON in monitoring/grafana/dashboards - do not change them.
+# =============================================================================
+apiVersion: 1
+
+datasources:
+  # Metrics: Prometheus (default datasource)
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 15s          # matches the scrape interval -> correct $__rate_interval
+      httpMethod: POST
+      queryTimeout: 60s
+
+  # Logs: Elasticsearch indices written by Logstash
+  # (scalebot-api-logs-*, scalebot-user-logs-*, scalebot-error-logs-*, scalebot-system-logs-*)
+  - name: Elasticsearch
+    uid: elasticsearch
+    type: elasticsearch
+    access: proxy
+    url: http://elasticsearch:9200
+    isDefault: false
+    editable: false
+    database: "scalebot-*-logs-*"  # legacy field, kept for older Grafana versions
+    jsonData:
+      index: "scalebot-*-logs-*"
+      timeField: "@timestamp"
+      esVersion: "8.0.0"
+      maxConcurrentShardRequests: 5
+      logMessageField: message
+      logLevelField: level
+      includeFrozen: false

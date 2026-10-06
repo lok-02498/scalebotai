@@ -1,0 +1,65 @@
+# =============================================================================
+# k8s/examples/pod.yaml — a BARE Pod (educational, do not use for workloads)
+# =============================================================================
+# A Pod is the smallest deployable unit: one or more containers sharing a
+# network namespace (same IP, talk via localhost) and volumes.
+#
+# Try it:
+#   kubectl apply -f k8s/examples/pod.yaml
+#   kubectl -n scalebotai get pod demo-bare-pod -o wide
+#   kubectl -n scalebotai delete pod demo-bare-pod
+#   kubectl -n scalebotai get pod demo-bare-pod      # -> NotFound. Gone forever.
+#
+# Why bare pods are not used for ScaleBotAI:
+#   * NO self-healing: nothing recreates the pod if it is deleted, evicted or
+#     its node dies (the kubelet only restarts crashed CONTAINERS in place,
+#     per restartPolicy, while the pod still exists on a healthy node).
+#   * NO scaling: one pod = one copy; you cannot `kubectl scale` a Pod.
+#   * NO rolling updates / rollback: most of the pod spec is immutable, so a
+#     new image means delete + recreate = downtime.
+# Compare with k8s/examples/replicaset.yaml and k8s/base/06-api-deployment.yaml.
+#
+# It uses an unprivileged NGINX image so it runs anywhere without the
+# database, and it satisfies the namespace's "restricted" Pod Security level.
+# =============================================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-bare-pod
+  namespace: scalebotai
+  labels:
+    # Deliberately NOT app: scalebotai-api — otherwise the API Service would
+    # start sending real user traffic to this demo pod!
+    app: demo-bare-pod
+    purpose: education
+spec:
+  # Always (default) | OnFailure | Never — applies to containers in THIS pod.
+  restartPolicy: Always
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101      # "nginx" user of nginx-unprivileged
+    runAsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: web
+      image: nginxinc/nginx-unprivileged:1.27-alpine
+      ports:
+        - name: http
+          containerPort: 8080
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+      readinessProbe:
+        httpGet:
+          path: /
+          port: http
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]

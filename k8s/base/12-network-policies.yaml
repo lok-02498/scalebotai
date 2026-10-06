@@ -1,0 +1,212 @@
+# =============================================================================
+# 12-network-policies.yaml — zero-trust networking inside `scalebotai`
+# =============================================================================
+# By default every pod can talk to every other pod in the cluster. A
+# NetworkPolicy selects pods (podSelector) and, for the directions listed in
+# policyTypes, ALLOWS only the listed traffic; everything else to/from those
+# pods is dropped. Policies are additive (union of all allows), there is no
+# explicit "deny" rule.
+#
+# Strategy: 1) default-deny ALL ingress + egress for every pod in the
+#           namespace, 2) open exactly the flows the architecture needs:
+#
+#   SOURCE                          -> DESTINATION      PORT
+#   any pod in scalebotai           -> kube-dns          53/UDP+TCP
+#   ingress-nginx namespace         -> scalebotai-api    8000
+#   monitoring namespace            -> scalebotai-api    8000 (/metrics scrape)
+#   scalebotai-api                  -> postgres          5432
+#   scalebotai-api                  -> redis             6379
+#   scalebotai-api                  -> ollama            11434 (optional LLM)
+#   postgres-exporter (optional)    -> postgres          5432
+#   redis-exporter (optional)       -> redis             6379
+# (exporter scrape + ollama model download rules live next to those optional
+#  workloads in k8s/optional/*.yaml.)
+#
+# REQUIREMENT: NetworkPolicies are enforced by the CNI plugin. minikube's
+# default CNI does NOT enforce them (they are silently ignored). Start the lab
+# cluster with a policy-capable CNI:  minikube start --cni=calico
+# Kubelet health probes come from the node and are always allowed.
+# =============================================================================
+
+# ---- 1. Default deny everything ---------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: scalebotai
+spec:
+  # Empty podSelector = ALL pods in the namespace.
+  podSelector: {}
+  # Listing both types with no ingress/egress rules = deny both directions.
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# ---- 2. DNS for everyone ---------------------------------------------------
+# Without this, egress-deny also blocks DNS and every hostname lookup
+# (postgres, redis, ollama) fails.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: scalebotai
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # namespaceSelector AND podSelector in the SAME list item = pods with
+        # label k8s-app=kube-dns that live in kube-system (CoreDNS).
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53   # large responses / truncation fall back to TCP
+  # (If the cluster runs NodeLocal DNSCache, also allow 169.254.20.10/32:53.)
+---
+# ---- 3. Who may call the API pods --------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-ingress
+  namespace: scalebotai
+spec:
+  # Matches stable, canary, blue and green pods alike.
+  podSelector:
+    matchLabels:
+      app: scalebotai-api
+  policyTypes:
+    - Ingress
+  ingress:
+    # a) the ingress-nginx controller (public traffic after TLS termination).
+    #    kubernetes.io/metadata.name is set automatically on every namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8000
+    # b) Prometheus in the monitoring namespace scraping /metrics.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# ---- 4. Where the API pods may connect to -------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-api-egress
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: scalebotai-api
+  policyTypes:
+    - Egress
+  egress:
+    # Policies see the traffic AFTER Service DNAT, so we match the destination
+    # PODS (labels) and their container ports, not the Service IP/port.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ollama
+      ports:
+        - protocol: TCP
+          port: 11434
+---
+# ---- 5. PostgreSQL accepts connections only from the API (and its exporter) ---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-ingress
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    # Two separate `from` entries = OR.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: scalebotai-api
+        - podSelector:
+            matchLabels:
+              app: postgres-exporter   # k8s/optional/postgres-exporter.yaml
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# ---- 6. Redis accepts connections only from the API (and its exporter) --------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-ingress
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: scalebotai-api
+        - podSelector:
+            matchLabels:
+              app: redis-exporter      # k8s/optional/redis-exporter.yaml
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# ---- 7. Ollama (optional LLM) accepts connections only from the API -----------
+# Harmless when Ollama is not deployed (selects no pods).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ollama-ingress
+  namespace: scalebotai
+spec:
+  podSelector:
+    matchLabels:
+      app: ollama
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: scalebotai-api
+      ports:
+        - protocol: TCP
+          port: 11434

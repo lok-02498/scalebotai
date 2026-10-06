@@ -1,0 +1,127 @@
+# =============================================================================
+# Alert rules (ConfigMap `prometheus-rules`)
+# =============================================================================
+# Kustomize cannot load files from outside its directory, so the rules are
+# INLINED here instead of referencing monitoring/prometheus/alert-rules.yml
+# (the docker-compose copy). Keep thresholds aligned with the SLOs:
+#   error rate < 1 %, avg/p95 latency < 300 ms, CPU < 80 %, memory < 80 %,
+#   99.9 % availability.
+#
+# Anatomy of a rule:
+#   expr   PromQL; every series it returns is a firing alert
+#   for    the condition must hold this long (Pending -> Firing) — filters blips
+#   labels severity drives routing in Alertmanager (page vs ticket)
+#   annotations human text; {{ $labels.x }} / {{ $value }} are templated
+#
+# Validate locally (promtool ships in the Prometheus image):
+#   kubectl -n monitoring exec deploy/prometheus -- promtool check rules /etc/prometheus/rules/alert-rules.yml
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+data:
+  alert-rules.yml: |
+    groups:
+      # ---------------------------------------------------------------------
+      - name: scalebotai-slo
+        rules:
+          - alert: HighErrorRate
+            # share of 5xx responses over 5 minutes, per namespace and track
+            # (so a bad CANARY fires on its own).
+            expr: |
+              (
+                sum by (namespace, track) (rate(scalebot_http_requests_total{status=~"5.."}[5m]))
+                /
+                sum by (namespace, track) (rate(scalebot_http_requests_total[5m]))
+              ) > 0.01
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "ScaleBotAI 5xx error rate above 1% ({{ $labels.track }})"
+              description: "{{ $value | humanizePercentage }} of requests failed in the last 5 minutes (namespace {{ $labels.namespace }}, track {{ $labels.track }})."
+
+          - alert: HighP95Latency
+            # 95th percentile from the histogram buckets (docs/09-monitoring-logging.md).
+            expr: |
+              histogram_quantile(
+                0.95,
+                sum by (namespace, le) (rate(scalebot_http_request_duration_seconds_bucket[5m]))
+              ) > 0.3
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "ScaleBotAI p95 latency above 300 ms"
+              description: "p95 latency is {{ $value | humanizeDuration }} (SLO: < 300 ms)."
+
+      # ---------------------------------------------------------------------
+      - name: scalebotai-kubernetes
+        rules:
+          - alert: PodCrashLooping
+            # kube-state-metrics: container waiting in CrashLoopBackOff.
+            expr: |
+              max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff", namespace=~"scalebotai|monitoring|logging"}[5m]) >= 1
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} is crash-looping"
+              description: "Container {{ $labels.container }} keeps restarting. Check: kubectl -n {{ $labels.namespace }} logs {{ $labels.pod }} -c {{ $labels.container }} --previous"
+
+          - alert: HPAMaxedOut
+            # The autoscaler cannot add more pods: capacity is exhausted.
+            expr: |
+              kube_horizontalpodautoscaler_status_current_replicas{namespace="scalebotai"}
+                >= kube_horizontalpodautoscaler_spec_max_replicas{namespace="scalebotai"}
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "HPA {{ $labels.horizontalpodautoscaler }} is at maxReplicas"
+              description: "Running at the configured maximum for 10 minutes. Raise maxReplicas, add nodes, or check the database bottleneck."
+
+          - alert: HighCPU
+            # container CPU usage relative to its CPU LIMIT (cAdvisor).
+            expr: |
+              sum by (namespace, pod) (rate(container_cpu_usage_seconds_total{namespace="scalebotai", container!="", container!="POD"}[5m]))
+              /
+              sum by (namespace, pod) (
+                (container_spec_cpu_quota{namespace="scalebotai", container!="", container!="POD"} > 0)
+                / container_spec_cpu_period{namespace="scalebotai", container!="", container!="POD"}
+              )
+              > 0.80
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} CPU above 80% of its limit"
+              description: "CPU usage is {{ $value | humanizePercentage }} of the limit (throttling likely)."
+
+          - alert: HighMemory
+            # working set (what the OOM killer looks at) vs memory LIMIT.
+            expr: |
+              sum by (namespace, pod) (container_memory_working_set_bytes{namespace="scalebotai", container!="", container!="POD"})
+              /
+              sum by (namespace, pod) (container_spec_memory_limit_bytes{namespace="scalebotai", container!="", container!="POD"} > 0)
+              > 0.80
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} memory above 80% of its limit"
+              description: "Memory working set is {{ $value | humanizePercentage }} of the limit — risk of OOMKill."
+
+          - alert: InstanceDown
+            # any scrape target unreachable (pod, exporter, kubelet, KSM).
+            expr: up == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Target {{ $labels.job }} / {{ $labels.instance }} is down"
+              description: "Prometheus could not scrape {{ $labels.instance }} (job {{ $labels.job }}, pod {{ $labels.pod }}) for 2 minutes."

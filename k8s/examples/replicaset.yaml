@@ -1,0 +1,83 @@
+# =============================================================================
+# k8s/examples/replicaset.yaml — a standalone ReplicaSet (educational)
+# =============================================================================
+# A ReplicaSet runs a reconciliation loop:
+#     observe  -> count pods matching .spec.selector
+#     diff     -> compare with .spec.replicas
+#     act      -> create pods from .spec.template (too few) or delete (too many)
+# That loop IS Kubernetes self-healing.
+#
+# Try it (demonstrates self-healing and scaling):
+#   kubectl apply -f k8s/examples/replicaset.yaml
+#   kubectl -n scalebotai get rs,pods -l app=demo-replicaset
+#   kubectl -n scalebotai delete pod <one-of-the-pods>      # killed...
+#   kubectl -n scalebotai get pods -l app=demo-replicaset -w  # ...replaced in seconds
+#   kubectl -n scalebotai scale rs demo-replicaset --replicas=5
+#   kubectl -n scalebotai delete rs demo-replicaset           # cleans up its pods
+#
+# Why we never write ReplicaSets by hand (and use a Deployment instead):
+#   Change the image in this file and re-apply: NOTHING happens to the running
+#   pods. A ReplicaSet only checks the NUMBER of matching pods, not whether
+#   they match the current template. Existing pods keep the old image until
+#   they are deleted. There is no rolling update, no maxSurge/maxUnavailable,
+#   no revision history and no `rollout undo`.
+#
+#   A Deployment solves this by managing ReplicaSets: each template change
+#   creates a NEW ReplicaSet (named <deployment>-<pod-template-hash>) and the
+#   Deployment controller scales the new one up and the old one down step by
+#   step. Old ReplicaSets are kept at 0 replicas (revisionHistoryLimit) so a
+#   rollback is just "scale the old ReplicaSet back up".
+#     kubectl -n scalebotai get rs -l app=scalebotai-api   # one RS per revision
+#
+# Selector gotcha: a ReplicaSet ADOPTS any existing ownerless pod whose labels
+# match its selector — e.g. it would adopt demo-bare-pod from pod.yaml if the
+# labels matched. That's why the labels here are unique.
+# =============================================================================
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: demo-replicaset
+  namespace: scalebotai
+  labels:
+    app: demo-replicaset
+    purpose: education
+spec:
+  replicas: 3
+  # Must match the template labels (validated by the API server).
+  selector:
+    matchLabels:
+      app: demo-replicaset
+  template:
+    metadata:
+      labels:
+        app: demo-replicaset
+        purpose: education
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

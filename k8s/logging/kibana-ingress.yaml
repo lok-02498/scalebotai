@@ -1,0 +1,51 @@
+# =============================================================================
+# OPTIONAL: expose Kibana at https://kibana.scalebotai.local
+# =============================================================================
+# NOT listed in k8s/logging/kustomization.yaml on purpose: Elasticsearch runs
+# without security in this lab, so a public Kibana = public logs (which
+# contain user IDs, IPs, request paths). Port-forward is the safer default.
+# If you do expose it, keep the basic-auth gate below:
+#
+#   # 1. TLS secret in the logging namespace (same self-signed cert as the API)
+#   NAMESPACES="scalebotai logging" ./k8s/tls/create-tls-secret.sh
+#   # 2. htpasswd file -> Secret (key MUST be named "auth")
+#   htpasswd -c auth admin            # or: printf "admin:$(openssl passwd -apr1)\n" > auth
+#   kubectl -n logging create secret generic kibana-basic-auth --from-file=auth
+#   # 3. apply + hosts entry  <minikube ip>  kibana.scalebotai.local
+#   kubectl apply -f k8s/logging/kibana-ingress.yaml
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kibana
+  namespace: logging
+  labels:
+    app: kibana
+    app.kubernetes.io/name: kibana
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # HTTP basic authentication enforced by ingress-nginx.
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: kibana-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "ScaleBotAI Kibana - authentication required"
+    # Only private networks (lab LAN / VPN) may reach it.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - kibana.scalebotai.local
+      secretName: scalebotai-tls
+  rules:
+    - host: kibana.scalebotai.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kibana
+                port:
+                  name: http

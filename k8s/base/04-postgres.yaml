@@ -1,0 +1,251 @@
+# =============================================================================
+# 04-postgres.yaml — PostgreSQL 16 as a StatefulSet + two Services
+# =============================================================================
+# Why a StatefulSet (and not a Deployment) for a database?
+#   * STABLE IDENTITY: pods are named postgres-0, postgres-1, ... and keep that
+#     name (and DNS record postgres-0.postgres-headless) across restarts.
+#   * ORDERED lifecycle: pods start/stop one at a time in ordinal order
+#     (podManagementPolicy: OrderedReady) — needed for primary/replica setups.
+#   * STABLE STORAGE: each ordinal is tied to its own PVC; a rescheduled
+#     postgres-0 re-attaches the SAME volume.
+#   * At-most-one semantics: the controller never runs two postgres-0 pods at
+#     the same time, so two processes never write the same data directory.
+#
+# Single replica: this is a lab/capstone database. Production HA Postgres
+# would use an operator (CloudNativePG, Zalando, Crunchy) or a managed DB
+# (RDS / Cloud SQL / Azure Database) with streaming replicas and backups.
+# =============================================================================
+
+# ---- Headless Service (clusterIP: None) -------------------------------------
+# Required by the StatefulSet (`serviceName`). It creates per-pod DNS records:
+#   postgres-0.postgres-headless.scalebotai.svc.cluster.local
+# No virtual IP / load-balancing — DNS returns the pod IPs directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: scalebotai
+  labels:
+    app: postgres
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  # Publish DNS records even before the pod is Ready (useful for replication
+  # bootstrapping; harmless here).
+  publishNotReadyAddresses: true
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# ---- ClusterIP Service "postgres" -------------------------------------------
+# The stable virtual IP + DNS name the API uses (POSTGRES_HOST=postgres).
+# Only Ready pods receive traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: scalebotai
+  labels:
+    app: postgres
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: scalebotai
+  labels:
+    app: postgres
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/version: "16"
+    tier: database
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  # RollingUpdate for StatefulSets replaces pods one by one from the highest
+  # ordinal down, waiting for each to be Ready.
+  updateStrategy:
+    type: RollingUpdate
+  revisionHistoryLimit: 5
+  # The selector is IMMUTABLE after creation and must match the template labels.
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: database
+        tier: database
+    spec:
+      # Postgres does not talk to the Kubernetes API -> no token mounted.
+      automountServiceAccountToken: false
+      # Do not inject legacy Docker-link env vars (e.g. REDIS_PORT=tcp://...)
+      # for every Service in the namespace.
+      enableServiceLinks: false
+      # Postgres needs time for a clean "fast shutdown" (checkpoint) on SIGTERM.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # "postgres" user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70            # dynamically provisioned volumes become group-writable
+        fsGroupChangePolicy: OnRootMismatch   # skip slow recursive chown when already correct
+        seccompProfile:
+          type: RuntimeDefault # default syscall filter of the container runtime
+      initContainers:
+        # Lab hostPath volumes become writable for uid 70 only after the
+        # kube-system Job in 03-storage.yaml has run. Wait here (pod shows
+        # Init:0/1) instead of crash-looping. With cloud volumes (fsGroup) the
+        # check passes immediately. Same image as the main container -> no
+        # extra pull; restricted-compliant (inherits the pod securityContext).
+        - name: wait-for-writable-volume
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              until [ -w /var/lib/postgresql/data ]; do
+                echo "waiting for /var/lib/postgresql/data to be writable by uid $(id -u) (see k8s/base/03-storage.yaml)"
+                sleep 3
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          # The image ENTRYPOINT (docker-entrypoint.sh) prepends `postgres`
+          # when the first argument starts with "-".
+          args:
+            - "-c"
+            - "max_connections=300"   # see DB pool math in 01-configmap.yaml
+            - "-c"
+            - "shared_buffers=256MB"  # ~25% of the memory limit
+            - "-c"
+            - "log_min_duration_statement=500"   # log queries slower than 500 ms
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          env:
+            # Credentials come from the Secret, the DB name from the ConfigMap.
+            # On FIRST start with an empty data dir, the entrypoint runs initdb
+            # and creates this user + database.
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: scalebotai-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: scalebotai-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: scalebotai-config
+                  key: POSTGRES_DB
+            # Use a SUB-directory of the mount: the volume root may contain
+            # lost+found (cloud disks), and initdb refuses non-empty dirs.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            # requests = what the scheduler reserves; limits = hard ceiling.
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # startupProbe gives initdb / crash recovery up to 30 x 5s = 150s
+          # before liveness takes over (liveness is disabled until it passes).
+          startupProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -p 5432']
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          # liveness: restart the container if Postgres stops answering for
+          # 6 x 10s = 1 minute.
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -p 5432']
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          # readiness: remove from the Service endpoints while not accepting
+          # connections (e.g. during startup or recovery).
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h 127.0.0.1 -p 5432']
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false   # no setuid/sudo escalation
+            readOnlyRootFilesystem: true      # only the mounted volumes are writable
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            # Unix socket + lock files (root FS is read-only).
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            # Postgres uses POSIX shared memory for parallel queries; the
+            # default 64Mi /dev/shm is too small.
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        # The PVC from 03-storage.yaml (bound to PV postgres-pv).
+        # For >1 replica you would instead use `volumeClaimTemplates:` so the
+        # StatefulSet creates one PVC per ordinal (data-postgres-0, -1, ...).
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi

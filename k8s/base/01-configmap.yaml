@@ -1,0 +1,100 @@
+# =============================================================================
+# 01-configmap.yaml — NON-secret application configuration
+# =============================================================================
+# A ConfigMap stores plain key/value configuration OUTSIDE the container image
+# (12-factor "config in the environment"): the SAME image runs in dev, staging
+# and prod, only the ConfigMap differs.
+#
+# The API Deployment loads every key below as an environment variable with
+#   envFrom: [{configMapRef: {name: scalebotai-config}}]
+#
+# IMPORTANT behaviour to remember (viva question!):
+#   * Env vars are read ONCE at container start. Editing this ConfigMap does
+#     NOT change running pods. Apply the change, then
+#       kubectl -n scalebotai rollout restart deployment/scalebotai-api
+#     which performs a zero-downtime rolling restart.
+#   * (Files mounted from a ConfigMap volume DO refresh after ~1 min, env vars
+#     never do.)
+#   * Alternative: kustomize `configMapGenerator` appends a content hash to the
+#     name (scalebotai-config-7f9c2...) so any change produces a new name and
+#     therefore an automatic rollout. We keep the fixed name `scalebotai-config`
+#     because Jenkins and the docs patch it by name (see .env.example).
+#
+# Values MUST be strings in YAML ("true", "10") — ConfigMap data is map[string]string.
+# Secrets (passwords, JWT key) are NOT here: see 02-secret.yaml.
+# Keys and defaults mirror .env.example exactly.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scalebotai-config
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: config
+data:
+  # ---- Application identity ------------------------------------------------
+  APP_NAME: "ScaleBotAI"
+  APP_ENV: "production"
+  # Fallback version. The Deployment overrides APP_VERSION per pod from the
+  # pod label app.kubernetes.io/version via the downward API (explicit `env`
+  # always wins over `envFrom`).
+  APP_VERSION: "1.0.0"
+
+  # ---- Logging -------------------------------------------------------------
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+  # Empty => log to stdout only. In Kubernetes the container runtime writes
+  # stdout to /var/log/containers/*.log, which Filebeat (k8s/logging) ships to
+  # Logstash. No log file / shared volume is needed (unlike docker-compose).
+  LOG_FILE: ""
+
+  # ---- Chatbot engine ------------------------------------------------------
+  # rule = keyword/regex engine (default, no GPU, millisecond latency)
+  # llm  = Ollama TinyLlama (deploy k8s/optional/ollama.yaml first)
+  CHATBOT_MODE: "rule"
+  OLLAMA_BASE_URL: "http://ollama:11434"
+  OLLAMA_MODEL: "tinyllama"
+  OLLAMA_TIMEOUT_SECONDS: "20"
+
+  # ---- Rate limiting & caching --------------------------------------------
+  RATE_LIMIT_ENABLED: "true"
+  # Per user/IP per minute. Raise it for load tests (docs/11-load-testing-strategy.md).
+  RATE_LIMIT_PER_MINUTE: "120"
+  CACHE_TTL_SECONDS: "3600"
+
+  # ---- Auth (non-secret parts; JWT_SECRET_KEY lives in the Secret) ---------
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+  REFRESH_TOKEN_EXPIRE_DAYS: "7"
+  JWT_ALGORITHM: "HS256"
+  BCRYPT_ROUNDS: "12"
+
+  # ---- Database pool (per pod!) ---------------------------------------------
+  # Max DB connections per pod = DB_POOL_SIZE + DB_MAX_OVERFLOW = 8.
+  # At the HPA maximum (20 pods) that is 160 connections, well under Postgres'
+  # max_connections=300 (04-postgres.yaml), leaving room for exporters, backups
+  # and admin sessions. The code defaults (10 + 20) would allow 20 x 30 = 600.
+  # A pod needs only ~1 busy connection (Little's law, docs/04 section 9.1);
+  # beyond ~35 pods put PgBouncer (transaction pooling) in front of Postgres.
+  DB_POOL_SIZE: "5"
+  DB_MAX_OVERFLOW: "3"
+  DB_POOL_TIMEOUT: "10"
+
+  CORS_ORIGINS: "*"
+  # Tables are created by the app at startup, guarded by a Postgres advisory
+  # lock so 3+ replicas starting together do not race.
+  AUTO_CREATE_TABLES: "true"
+
+  # ---- Service discovery ---------------------------------------------------
+  # Kubernetes DNS: the short name "postgres" resolves to the ClusterIP Service
+  # postgres.scalebotai.svc.cluster.local from any pod in this namespace.
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "scalebotai"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  # ---- Bootstrap admin (password is in the Secret) -------------------------
+  ADMIN_USERNAME: "admin"
+  ADMIN_EMAIL: "admin@scalebotai.local"

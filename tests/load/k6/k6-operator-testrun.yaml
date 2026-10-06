@@ -1,0 +1,115 @@
+# =============================================================================
+# ScaleBotAI - distributed k6 runs with the Grafana k6-operator
+# -----------------------------------------------------------------------------
+# One k6 process can drive roughly 5,000-10,000 VUs of this HTTP+JSON workload
+# (memory ~1-3 MB per VU, CPU for TLS); 25,000-50,000 VUs therefore need many
+# runner pods on several nodes. The operator splits the VUs evenly between the
+# `parallelism` runners (k6 execution segments) and starts them together.
+#
+# 1. Install the operator (once):
+#      kubectl apply --server-side -f https://raw.githubusercontent.com/grafana/k6-operator/main/bundle.yaml
+# 2. Package the script + lib/common.js (+ the remote jslib import) into one archive
+#    and store it in a ConfigMap (ConfigMap keys cannot contain sub-directories,
+#    an archive keeps ./lib/common.js working):
+#      kubectl create namespace loadtest
+#      k6 archive tests/load/k6/stress.js -O stress.tar
+#      k6 archive tests/load/k6/spike.js  -O spike.tar
+#      kubectl -n loadtest create configmap scalebotai-k6-scripts \
+#        --from-file=stress.tar --from-file=spike.tar --dry-run=client -o yaml | kubectl apply -f -
+# 3. Start a run (re-apply = new run after deleting the old TestRun):
+#      kubectl -n loadtest delete testrun scalebotai-stress --ignore-not-found
+#      kubectl apply -f tests/load/k6/k6-operator-testrun.yaml
+#      kubectl -n loadtest get testrun,pods -w
+# 4. Watch Grafana "ScaleBotAI - Load Testing War Room" (k6 metrics arrive via
+#    Prometheus remote write; Prometheus must run with --web.enable-remote-write-receiver).
+#
+# Before running: raise RATE_LIMIT_PER_MINUTE (or RATE_LIMIT_ENABLED=false) in the
+# scalebotai-config ConfigMap and the ingress-nginx rate limits for the test, and make
+# sure the cluster has spare nodes for the runners (separate: true = one runner per node).
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: loadtest
+  labels:
+    app.kubernetes.io/part-of: scalebotai
+    purpose: load-testing
+---
+# STRESS: 25 runners x 1,000 VUs = 25,000 VUs at the last step
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: scalebotai-stress
+  namespace: loadtest
+spec:
+  parallelism: 25
+  separate: false                 # true = at most one runner per node (needs >= 25 nodes)
+  script:
+    configMap:
+      name: scalebotai-k6-scripts
+      file: stress.tar
+  arguments: --out experimental-prometheus-rw --tag testid=stress-001
+  runner:
+    image: grafana/k6:0.54.0
+    env:
+      # Through the Ingress (realistic: TLS + ingress-nginx). Requires that
+      # api.scalebotai.local resolves inside the cluster (CoreDNS rewrite/hosts entry).
+      # Alternative that bypasses the Ingress: http://scalebotai-api.scalebotai.svc.cluster.local
+      - name: BASE_URL
+        value: https://api.scalebotai.local
+      - name: AUTH_MODE
+        value: pool               # pre-created accounts: avoids 25k simultaneous bcrypt logins
+      - name: POOL_SIZE
+        value: "500"
+      - name: K6_PROMETHEUS_RW_SERVER_URL
+        value: http://prometheus.monitoring.svc:9090/api/v1/write
+      - name: K6_PROMETHEUS_RW_TREND_STATS
+        value: "p(95),p(99),avg"
+      - name: K6_PROMETHEUS_RW_PUSH_INTERVAL
+        value: 10s
+      - name: RESULTS_DIR
+        value: /tmp               # handleSummary files stay in the runner pod; the summary is also in its logs
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
+---
+# SPIKE: 50 runners x 1,000 VUs = 50,000 VUs at the top of the spike
+apiVersion: k6.io/v1alpha1
+kind: TestRun
+metadata:
+  name: scalebotai-spike
+  namespace: loadtest
+spec:
+  parallelism: 50
+  separate: false
+  script:
+    configMap:
+      name: scalebotai-k6-scripts
+      file: spike.tar
+  arguments: --out experimental-prometheus-rw --tag testid=spike-001
+  runner:
+    image: grafana/k6:0.54.0
+    env:
+      - name: BASE_URL
+        value: https://api.scalebotai.local
+      - name: AUTH_MODE
+        value: pool
+      - name: POOL_SIZE
+        value: "1000"
+      - name: K6_PROMETHEUS_RW_SERVER_URL
+        value: http://prometheus.monitoring.svc:9090/api/v1/write
+      - name: K6_PROMETHEUS_RW_TREND_STATS
+        value: "p(95),p(99),avg"
+      - name: RESULTS_DIR
+        value: /tmp
+    resources:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi

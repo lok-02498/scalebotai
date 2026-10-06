@@ -1,0 +1,52 @@
+# =============================================================================
+# Jenkins plugins for the ScaleBotAI pipeline
+# Installed at image build time by: jenkins-plugin-cli --plugin-file plugins.txt
+# Format: <plugin-id>[:<version>]  (no version = latest compatible; dependencies resolved automatically)
+# Pin versions (e.g. git:5.7.0) for fully reproducible controller images.
+# =============================================================================
+
+# --- Pipeline core ------------------------------------------------------------
+workflow-aggregator
+pipeline-model-definition
+pipeline-stage-view
+pipeline-graph-view
+pipeline-utility-steps
+
+# --- Source control / GitHub ---------------------------------------------------
+git
+github
+github-branch-source
+branch-api
+
+# --- Credentials ----------------------------------------------------------------
+credentials
+credentials-binding
+plain-credentials
+ssh-credentials
+
+# --- Docker / Kubernetes ---------------------------------------------------------
+docker-workflow
+kubernetes-cli
+
+# --- Test and quality reporting ---------------------------------------------------
+junit
+coverage
+
+# --- Build hygiene -----------------------------------------------------------------
+timestamper
+ws-cleanup
+build-timeout
+ansicolor
+
+# --- Notifications -----------------------------------------------------------------
+email-ext
+mailer
+slack
+
+# --- Security / administration ------------------------------------------------------
+matrix-auth
+configuration-as-code
+
+# --- Optional UI -----------------------------------------------------------------------
+# Blue Ocean is in maintenance mode; pipeline-graph-view (above) is its modern replacement.
+# blueocean

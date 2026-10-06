@@ -1,0 +1,448 @@
+#!/usr/bin/env groovy
+/*
+ * =============================================================================
+ *  ScaleBotAI - Jenkins Declarative Pipeline
+ * =============================================================================
+ *  Job type     Multibranch Pipeline (GitHub Branch Source), Script Path: jenkins/Jenkinsfile
+ *  Stages       Checkout -> Build -> Unit Test -> Lint -> Docker Build -> Security Scan
+ *               -> Docker Push -> Kubernetes Deploy -> Smoke Test -> (Rollback on failure)
+ *  Credentials  dockerhub-credentials  Username with password (Docker Hub user + access token)
+ *               kubeconfig-scalebotai  Secret file (kubeconfig of ServiceAccount jenkins-deployer)
+ *  Agent tools  python3.12, docker (+ buildx), kubectl, trivy, curl  - see jenkins/Dockerfile
+ *
+ *  Branch behaviour
+ *    feature/*, hotfix/*, PR-*   build, test, lint, image build + scan (nothing is published)
+ *    develop                     + push <DOCKERHUB_USER>/scalebotai-api:<BUILD_NUMBER>-<sha>
+ *    main                        + push :latest, deploy to Kubernetes, smoke test, auto-rollback
+ *
+ *  Quoting convention
+ *    Every sh step uses a SINGLE-quoted Groovy string ('...' or '''...''') so $VARIABLES are
+ *    expanded by the shell from the environment, never interpolated by Groovy. This keeps
+ *    credentials out of the Groovy layer (no "insecure interpolation of sensitive variables").
+ *    Inside '''...''' a trailing backslash is a Groovy line continuation - no other
+ *    backslash escapes are used in shell snippets.
+ * =============================================================================
+ */
+
+// -----------------------------------------------------------------------------
+// Pipeline-wide flags. env.* can only hold strings, so these script-level
+// variables carry the deploy outcome to the conditional Rollback stage and to
+// the post { failure / aborted } safety net.
+// -----------------------------------------------------------------------------
+def deployStarted    = false   // scripts/deploy.sh has been invoked
+def deployVerified   = false   // post-deploy smoke test passed
+def rollbackRequired = false   // Kubernetes Deploy or Smoke Test failed
+def rollbackDone     = false   // scripts/rollback.sh completed successfully
+def failureReason    = ''
+
+pipeline {
+    // The controller image in jenkins/Dockerfile ships every tool this pipeline needs.
+    // For production, run builds on a dedicated agent instead, e.g. agent { label 'scalebotai' }.
+    agent any
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()          // one build per branch: never two deploys at once
+        skipDefaultCheckout(false)         // implicit checkout runs before environment{} (GIT_SHORT below)
+    }
+
+    parameters {
+        string(name: 'DOCKERHUB_USER', defaultValue: 'scalebotai',
+               description: 'Docker Hub namespace; the image is <DOCKERHUB_USER>/scalebotai-api')
+        choice(name: 'DEPLOY_STRATEGY', choices: ['rolling', 'canary', 'blue-green'],
+               description: 'Kubernetes release strategy used by scripts/deploy.sh (main branch only)')
+        booleanParam(name: 'SKIP_DEPLOY', defaultValue: false,
+                     description: 'Build, test, scan and push, but do not deploy to Kubernetes')
+    }
+
+    environment {
+        // Docker Hub repository of the API image (image: <DOCKERHUB_USER>/scalebotai-api).
+        // The ?: fallbacks cover the very first build of a new branch job, before Jenkins has
+        // registered the parameters{} definitions.
+        IMAGE_NAME      = "${params.DOCKERHUB_USER ?: 'scalebotai'}/scalebotai-api"
+        DEPLOY_STRATEGY = "${params.DEPLOY_STRATEGY ?: 'rolling'}"
+        // 7-character commit SHA of the revision checked out by the implicit SCM checkout
+        GIT_SHORT     = sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
+        // Immutable, traceable image tag: <Jenkins build number>-<short sha>, e.g. 42-a1b2c3d
+        IMAGE_TAG     = "${BUILD_NUMBER}-${GIT_SHORT}"
+        K8S_NAMESPACE = 'scalebotai'
+        APP_URL       = 'https://api.scalebotai.local'
+
+        DOCKER_BUILDKIT               = '1'
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        PYTHONDONTWRITEBYTECODE       = '1'
+        PYTHONUNBUFFERED              = '1'
+        TRIVY_NO_PROGRESS             = 'true'
+        TRIVY_SKIP_VERSION_CHECK      = 'true'
+    }
+
+    stages {
+        // ---------------------------------------------------------------------
+        // 1. Checkout - sync the exact revision, print commit info
+        // ---------------------------------------------------------------------
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    def shortSha = sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
+                    if (shortSha != env.GIT_SHORT) {
+                        error("HEAD moved during checkout (${env.GIT_SHORT} -> ${shortSha}); refusing to build an inconsistent tag")
+                    }
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.BRANCH_NAME ?: 'local'}@${shortSha}"
+                }
+                sh '''
+                    echo "Branch      : ${BRANCH_NAME:-n/a}"
+                    echo "Commit      : $(git log -1 --pretty=format:'%H')"
+                    echo "Author      : $(git log -1 --pretty=format:'%an <%ae>')"
+                    echo "Date        : $(git log -1 --pretty=format:'%cI')"
+                    echo "Subject     : $(git log -1 --pretty=format:'%s')"
+                    echo "Image       : ${IMAGE_NAME}:${IMAGE_TAG}"
+                    # Scripts authored on Windows may lose the executable bit in Git.
+                    chmod +x scripts/*.sh
+                '''
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. Build - isolated virtualenv, dependencies, byte-compile sources
+        // ---------------------------------------------------------------------
+        stage('Build') {
+            steps {
+                sh '''
+                    command -v python3.12 >/dev/null 2>&1 || { echo "python3.12 not found on this agent"; exit 1; }
+                    python3.12 -m venv .venv
+                    .venv/bin/python -m pip install --upgrade pip wheel
+                    .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+                    # Defensive: the quality gates below need these even if requirements-dev.txt drifts.
+                    for tool in pytest-cov ruff bandit; do
+                        .venv/bin/python -m pip show "$tool" >/dev/null 2>&1 || .venv/bin/python -m pip install "$tool"
+                    done
+                    .venv/bin/python -m compileall -q src
+                    mkdir -p reports
+                    .venv/bin/python -m pip freeze > reports/pip-freeze.txt
+                '''
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 3. Unit Test - pytest + coverage gate (>= 70 %)
+        // ---------------------------------------------------------------------
+        stage('Unit Test') {
+            steps {
+                sh '''
+                    mkdir -p reports
+                    .venv/bin/python -m pytest \
+                        --junitxml=reports/junit.xml \
+                        --cov=app \
+                        --cov-report=xml:reports/coverage.xml \
+                        --cov-report=term-missing:skip-covered \
+                        --cov-fail-under=70
+                '''
+            }
+            post {
+                always {
+                    junit testResults: 'reports/junit.xml', allowEmptyResults: true
+                    script {
+                        if (fileExists('reports/coverage.xml')) {
+                            // Coverage plugin (coverage.py XML is Cobertura format)
+                            recordCoverage(tools: [[parser: 'COBERTURA', pattern: 'reports/coverage.xml']],
+                                           sourceCodeRetention: 'LAST_BUILD')
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 4. Lint - style, formatting and SAST in parallel
+        // ---------------------------------------------------------------------
+        stage('Lint') {
+            parallel {
+                stage('Ruff check') {
+                    steps {
+                        sh '.venv/bin/ruff check src tests'
+                    }
+                }
+                stage('Ruff format') {
+                    steps {
+                        sh '.venv/bin/ruff format --check src tests'
+                    }
+                }
+                stage('Bandit SAST') {
+                    steps {
+                        sh '''
+                            mkdir -p reports
+                            # Archived JSON report (never fails the build) ...
+                            .venv/bin/bandit -r src/app -ll -f json -o reports/bandit.json || true
+                            # ... and the gate: fail on MEDIUM or HIGH severity findings.
+                            .venv/bin/bandit -r src/app -ll
+                        '''
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 5. Docker Build - multi-stage image with BuildKit and OCI build args
+        // ---------------------------------------------------------------------
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    docker version --format 'Docker client {{.Client.Version}} / server {{.Server.Version}}'
+                    docker build \
+                        --pull \
+                        --file docker/api/Dockerfile \
+                        --build-arg VERSION="${IMAGE_TAG}" \
+                        --build-arg VCS_REF="${GIT_COMMIT}" \
+                        --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        --build-arg BUILDKIT_INLINE_CACHE=1 \
+                        --cache-from "${IMAGE_NAME}:latest" \
+                        --tag "${IMAGE_NAME}:${IMAGE_TAG}" \
+                        .
+                    docker image inspect "${IMAGE_NAME}:${IMAGE_TAG}" --format 'Built {{.Id}} ({{.Size}} bytes)'
+                '''
+                script {
+                    if (env.BRANCH_NAME == 'main') {
+                        sh 'docker tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"'
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 6. Security Scan - Trivy image + repository scans
+        //    Reports land in reports/ and are archived by post { always }.
+        // ---------------------------------------------------------------------
+        stage('Security Scan') {
+            steps {
+                sh '''
+                    mkdir -p reports
+                    IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+
+                    # (a) Non-blocking: full HIGH + CRITICAL vulnerability report for the image.
+                    trivy image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 \
+                        --format json --output reports/trivy-image.json "${IMAGE}"
+                    trivy convert --format table --output reports/trivy-image-report.txt reports/trivy-image.json
+                    cat reports/trivy-image-report.txt
+
+                    # (b) Non-blocking: IaC misconfiguration report (Dockerfiles, k8s manifests).
+                    trivy fs --scanners misconfig --exit-code 0 \
+                        --skip-dirs .venv,reports,.git \
+                        --format table --output reports/trivy-misconfig.txt .
+
+                    # (c) BLOCKING: hard-coded secrets committed to the repository.
+                    #     docs/ is skipped because it contains illustrative example tokens.
+                    trivy fs --scanners secret --severity HIGH,CRITICAL --exit-code 1 \
+                        --skip-dirs .venv,reports,.git,docs .
+
+                    # (d) BLOCKING: fixable CRITICAL vulnerabilities in the image.
+                    trivy image --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 "${IMAGE}"
+                '''
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 7. Docker Push - only main / develop publish images
+        // ---------------------------------------------------------------------
+        stage('Docker Push') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            environment {
+                // Per-build Docker config: the registry login never persists in JENKINS_HOME.
+                DOCKER_CONFIG = "${WORKSPACE}/.docker-config"
+            }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials',
+                                                  usernameVariable: 'DOCKERHUB_USERNAME',
+                                                  passwordVariable: 'DOCKERHUB_TOKEN')]) {
+                    sh '''
+                        mkdir -p "${DOCKER_CONFIG}"
+                        printf '%s' "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+                        docker push "${IMAGE_NAME}:${IMAGE_TAG}"
+                        if [ "${BRANCH_NAME}" = "main" ]; then
+                            docker push "${IMAGE_NAME}:latest"
+                        fi
+                        echo "Pushed digest: $(docker image inspect --format '{{index .RepoDigests 0}}' "${IMAGE_NAME}:${IMAGE_TAG}")"
+                    '''
+                }
+            }
+            post {
+                always {
+                    sh 'docker logout || true; rm -rf "${DOCKER_CONFIG}"'
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 8. Kubernetes Deploy - main only, strategy chosen by DEPLOY_STRATEGY
+        //    A failure does NOT abort the pipeline: it sets rollbackRequired and
+        //    marks the stage/build FAILED so that the Rollback stage still runs.
+        // ---------------------------------------------------------------------
+        stage('Kubernetes Deploy') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { return !params.SKIP_DEPLOY }
+                }
+            }
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig-scalebotai', variable: 'KUBECONFIG')]) {
+                    script {
+                        // Record the image currently serving traffic - the rollback target.
+                        env.PREVIOUS_IMAGE = sh(returnStdout: true, script: '''
+                            kubectl -n "${K8S_NAMESPACE}" get deployment scalebotai-api \
+                                -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].image}' 2>/dev/null || true
+                        ''').trim()
+                        echo "Previous image (rollback target): ${env.PREVIOUS_IMAGE ?: '<none - first deployment>'}"
+                        sh 'kubectl -n "${K8S_NAMESPACE}" rollout history deployment/scalebotai-api 2>/dev/null | tail -n 5 || true'
+
+                        deployStarted = true
+                        def rc = sh(returnStatus: true,
+                                    script: 'scripts/deploy.sh "$DEPLOY_STRATEGY" "$IMAGE_NAME:$IMAGE_TAG"')
+                        if (rc != 0) {
+                            rollbackRequired = true
+                            failureReason = "scripts/deploy.sh (${env.DEPLOY_STRATEGY}) exited with code ${rc}"
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                                error(failureReason)
+                            }
+                        } else {
+                            currentBuild.description = "Deployed ${env.IMAGE_NAME}:${env.IMAGE_TAG} (${env.DEPLOY_STRATEGY})"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 9. Smoke Test - end-to-end check through the public Ingress URL
+        // ---------------------------------------------------------------------
+        stage('Smoke Test') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { return !params.SKIP_DEPLOY }
+                    expression { return deployStarted && !rollbackRequired }
+                }
+            }
+            environment {
+                INSECURE = '1'   // the local cluster serves a self-signed certificate (k8s/tls)
+            }
+            steps {
+                script {
+                    int maxAttempts = 3
+                    boolean passed = false
+                    for (int attempt = 1; attempt <= maxAttempts && !passed; attempt++) {
+                        echo "Smoke test attempt ${attempt}/${maxAttempts} against ${env.APP_URL}"
+                        passed = (sh(returnStatus: true, script: 'scripts/smoke_test.sh "$APP_URL"') == 0)
+                        if (!passed && attempt < maxAttempts) {
+                            sleep(time: 15 * attempt, unit: 'SECONDS')
+                        }
+                    }
+                    if (passed) {
+                        deployVerified = true
+                    } else {
+                        rollbackRequired = true
+                        failureReason = "smoke test against ${env.APP_URL} failed after ${maxAttempts} attempts"
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            error(failureReason)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 10. Rollback - runs only when Kubernetes Deploy or Smoke Test failed
+        // ---------------------------------------------------------------------
+        stage('Rollback') {
+            when {
+                expression { return rollbackRequired }
+            }
+            steps {
+                script {
+                    echo "ROLLBACK (${env.DEPLOY_STRATEGY}) triggered: ${failureReason}"
+                    int rc = invokeRollback()
+                    if (rc == 0) {
+                        rollbackDone = true
+                        echo "Rollback completed - previous release restored (${env.PREVIOUS_IMAGE ?: 'previous revision'})"
+                    } else {
+                        error("scripts/rollback.sh exited with code ${rc} - MANUAL INTERVENTION REQUIRED")
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true, fingerprint: true
+            // Remove this build's image tag from the shared Docker daemon (on main the image stays
+            // reachable as :latest and serves as the BuildKit cache for the next build).
+            sh '''
+                docker image rm "${IMAGE_NAME}:${IMAGE_TAG}" >/dev/null 2>&1 || true
+                docker image prune --force --filter "label=org.opencontainers.image.revision=${GIT_COMMIT}" >/dev/null 2>&1 || true
+            '''
+        }
+        success {
+            echo "SUCCESS: ${env.IMAGE_NAME}:${env.IMAGE_TAG} (${env.BRANCH_NAME}) - ${env.BUILD_URL}"
+            // slackSend(channel: '#scalebotai-ci', color: 'good',
+            //           message: "SUCCESS ${env.JOB_NAME} #${env.BUILD_NUMBER} ${env.IMAGE_NAME}:${env.IMAGE_TAG} (<${env.BUILD_URL}|open>)")
+            // emailext(to: 'devops@scalebotai.dev', subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+            //          body: "Image ${env.IMAGE_NAME}:${env.IMAGE_TAG} built and released.\n${env.BUILD_URL}")
+        }
+        failure {
+            script {
+                // Safety net: a deploy started but was never verified and never rolled back
+                // (e.g. the Rollback stage itself failed, or an unexpected exception).
+                if (deployStarted && !deployVerified && !rollbackDone) {
+                    echo 'Safety net: running scripts/rollback.sh from post { failure }'
+                    int rc = invokeRollback()
+                    rollbackDone = (rc == 0)
+                    if (!rollbackDone) {
+                        echo "Safety-net rollback FAILED (exit ${rc}) - MANUAL INTERVENTION REQUIRED"
+                    }
+                }
+            }
+            echo "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER} - ${failureReason ?: 'see stage logs'} - ${env.BUILD_URL}"
+            // slackSend(channel: '#scalebotai-ci', color: 'danger',
+            //           message: "FAILED ${env.JOB_NAME} #${env.BUILD_NUMBER}: ${failureReason} (<${env.BUILD_URL}|open>)")
+            // emailext(to: 'devops@scalebotai.dev', recipientProviders: [culprits(), developers()],
+            //          subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+            //          body: "${failureReason}\nRollback done: ${rollbackDone}\n${env.BUILD_URL}console")
+        }
+        aborted {
+            script {
+                // An aborted / timed-out deploy may leave a half-finished release behind.
+                if (deployStarted && !deployVerified && !rollbackDone) {
+                    echo 'Build aborted during deployment: running scripts/rollback.sh'
+                    rollbackDone = (invokeRollback() == 0)
+                }
+            }
+        }
+        cleanup {
+            // cleanup{} runs after every other post condition, so failure{} above can still
+            // use scripts/ and .deploy-state before the workspace is wiped.
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+        }
+    }
+}
+
+/**
+ * Runs scripts/rollback.sh for the selected strategy with the cluster kubeconfig.
+ * PREVIOUS_IMAGE (recorded in Kubernetes Deploy) is exported for rollback.sh as a fallback
+ * to the .deploy-state file written by scripts/deploy.sh.
+ * @return the script's exit code (0 = rolled back)
+ */
+int invokeRollback() {
+    int rc = 1
+    withCredentials([file(credentialsId: 'kubeconfig-scalebotai', variable: 'KUBECONFIG')]) {
+        rc = sh(returnStatus: true, script: 'scripts/rollback.sh "$DEPLOY_STRATEGY"')
+    }
+    return rc
+}

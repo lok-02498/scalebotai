@@ -1,0 +1,68 @@
+# =============================================================================
+# k8s/base/kustomization.yaml — one command deploys the whole application tier
+# =============================================================================
+#   kubectl apply -k k8s/base          # render + apply
+#   kubectl kustomize k8s/base         # just render (review / CI validation)
+#   kubectl diff -k k8s/base           # what would change on the cluster
+#
+# Kustomize is built into kubectl (-k). It renders plain YAML — no templating
+# language — by applying transformations (labels, images, patches) on top of
+# the resources listed below.
+#
+# Why NO top-level `namespace:` field here?
+#   This kustomization is namespace-agnostic: 00-namespaces.yaml creates THREE
+#   namespaces and 03-storage.yaml contains cluster-scoped PersistentVolumes and
+#   a StorageClass. A top-level `namespace: scalebotai` would rename every
+#   Namespace object to "scalebotai". Instead each namespaced manifest states
+#   `metadata.namespace: scalebotai` explicitly, which also makes every file
+#   usable on its own with `kubectl apply -f`.
+#
+# Apply order: kubectl/kustomize sorts by kind (Namespace, StorageClass, PV,
+# ServiceAccount, Role, ConfigMap, Secret, Service, Deployment, ...), so the
+# file numbers are for humans; the order below is still dependency order.
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespaces.yaml
+  - 01-configmap.yaml
+  - 02-secret.yaml            # placeholders! replace in production (see file header)
+  - 03-storage.yaml
+  - 04-postgres.yaml
+  - 05-redis.yaml
+  - 06-api-deployment.yaml
+  - 07-api-service.yaml
+  - 08-ingress.yaml
+  - 09-hpa.yaml
+  - 10-pdb.yaml
+  - 11-rbac.yaml
+  - 12-network-policies.yaml
+  # NOT included on purpose (apply separately when wanted):
+  #   ../optional/ollama.yaml, ../optional/postgres-exporter.yaml,
+  #   ../optional/redis-exporter.yaml, ../strategies/**, ../examples/**
+
+# Common labels added to every object's metadata.labels.
+# includeSelectors: false -> do NOT inject them into spec.selector /
+#   matchLabels. Selectors are immutable; changing them later would force you
+#   to delete & recreate Deployments, and it would also break the
+#   canary/blue-green selectors that deliberately share `app: scalebotai-api`.
+# includeTemplates: false -> do not touch pod templates either (adding a
+#   label to a pod template triggers a rollout).
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: scalebotai
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+    includeTemplates: false
+
+# Image override point for CI. Every container whose image NAME is
+# scalebotai/scalebotai-api gets this name/tag at render time:
+#   cd k8s/base
+#   kustomize edit set image scalebotai/scalebotai-api=docker.io/<user>/scalebotai-api:42-abc1234
+#   kubectl apply -k .
+# (Jenkins' default path uses `kubectl set image` instead — see scripts/deploy.sh.)
+images:
+  - name: scalebotai/scalebotai-api
+    newName: scalebotai/scalebotai-api
+    newTag: latest

@@ -1,0 +1,145 @@
+# =============================================================================
+# Prometheus server: PVC + Deployment + Service (namespace monitoring)
+# =============================================================================
+# UI:  kubectl -n monitoring port-forward svc/prometheus 9090:9090
+#      http://localhost:9090  -> Status > Targets (all should be UP),
+#                                Alerts (rules from prometheus-rules.yaml)
+#
+# Single replica with a persistent TSDB. HA options for production: run 2
+# identical replicas (Alertmanager de-duplicates alerts) plus Thanos/Mimir for
+# long-term storage, or use the Prometheus Operator (kube-prometheus-stack).
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  # Default StorageClass (dynamic provisioning): minikube "standard",
+  # EKS gp2/gp3, GKE standard-rwo ...
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: monitoring
+spec:
+  replicas: 1
+  # RWO volume + TSDB lock file: never run two Prometheus on the same data.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        app.kubernetes.io/name: prometheus
+      annotations:
+        # Changing this value forces a restart; useful after big config edits:
+        #   kubectl -n monitoring rollout restart deploy/prometheus
+        scalebotai.io/config-version: "1"
+    spec:
+      serviceAccountName: prometheus
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60   # flush the WAL cleanly
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534     # nobody (image default)
+        runAsGroup: 65534
+        fsGroup: 65534       # make the PVC writable for uid 65534
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.5.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/config/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # Keep 15 days or 8 GB, whichever comes first (PVC is 10Gi).
+            - --storage.tsdb.retention.time=15d
+            - --storage.tsdb.retention.size=8GB
+            # Enables POST /-/reload (hot config reload) and /-/quit.
+            - --web.enable-lifecycle
+          ports:
+            - name: web
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: web
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: web
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # Whole-directory mounts (no subPath!) so `kubectl apply` edits of
+            # the ConfigMaps propagate into the running pod within ~1 minute;
+            # then POST /-/reload. (subPath mounts never refresh.)
+            - name: config
+              mountPath: /etc/prometheus/config
+              readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+    app.kubernetes.io/name: prometheus
+spec:
+  type: ClusterIP
+  selector:
+    app: prometheus
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web

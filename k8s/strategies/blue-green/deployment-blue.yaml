@@ -1,0 +1,187 @@
+# =============================================================================
+# Blue-green: the BLUE environment (Deployment scalebotai-api-blue)
+# =============================================================================
+# Blue and green are two complete, identical production environments. At any
+# time exactly ONE is "active" (receives user traffic via Service
+# scalebotai-api-active); the other is "idle" (reachable only through
+# scalebotai-api-preview for smoke tests). A release goes to the idle colour,
+# is tested there, and then switch.sh flips the active Service's selector:
+# an atomic, instant cut-over, and an equally instant rollback.
+#
+# ALTERNATIVE to k8s/base/06-api-deployment.yaml — see README.md:
+#   these pods carry app: scalebotai-api (so NetworkPolicies, the PDB,
+#   Prometheus and Filebeat treat them exactly like the stable pods), but the
+#   public Ingress points at scalebotai-api-active, NOT at scalebotai-api.
+#   Don't run the base Deployment and blue/green behind the same Service.
+#
+# Pod template = base Deployment's template with `color: blue` instead of
+# `track: stable` (the base selector requires track=stable, so the base
+# Deployment can never adopt these pods, and vice versa).
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalebotai-api-blue
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.0.0"
+    app: scalebotai-api
+    tier: backend
+    color: blue
+  annotations:
+    kubernetes.io/change-cause: "blue environment initial deployment"
+spec:
+  # Fixed size: both colours run at full production capacity so the switch
+  # (and a rollback) never lands on an under-sized environment. Attach an HPA
+  # per colour if needed (scaleTargetRef: scalebotai-api-blue).
+  replicas: 3
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: scalebotai-api
+      color: blue
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalebotai-api
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: api
+        app.kubernetes.io/version: "1.0.0"
+        app: scalebotai-api
+        tier: backend
+        color: blue
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: scalebotai-api
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: scalebotai-api
+              color: blue
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: scalebotai-api
+                    color: blue
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      containers:
+        - name: api
+          # Set per release with:
+          #   kubectl -n scalebotai set image deployment/scalebotai-api-blue api=<image>:<tag>
+          image: scalebotai/scalebotai-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: scalebotai-config
+            - secretRef:
+                name: scalebotai-secrets
+          env:
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

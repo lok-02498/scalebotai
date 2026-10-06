@@ -1,0 +1,178 @@
+# =============================================================================
+# Blue-green: the GREEN environment (Deployment scalebotai-api-green)
+# =============================================================================
+# Identical to deployment-blue.yaml except for the colour. Initially GREEN is
+# the idle environment: Service scalebotai-api-preview selects it, so a new
+# release can be deployed and smoke-tested here while BLUE serves users.
+#   kubectl -n scalebotai set image deployment/scalebotai-api-green api=<image>:<tag>
+#   kubectl -n scalebotai rollout status deployment/scalebotai-api-green --timeout=300s
+#   ./k8s/strategies/blue-green/switch.sh green
+# See deployment-blue.yaml and README.md for the full explanation.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalebotai-api-green
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.0.0"
+    app: scalebotai-api
+    tier: backend
+    color: green
+  annotations:
+    kubernetes.io/change-cause: "green environment initial deployment"
+spec:
+  # Fixed size: both colours run at full production capacity so the switch
+  # (and a rollback) never lands on an under-sized environment. Attach an HPA
+  # per colour if needed (scaleTargetRef: scalebotai-api-green).
+  replicas: 3
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: scalebotai-api
+      color: green
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalebotai-api
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: api
+        app.kubernetes.io/version: "1.0.0"
+        app: scalebotai-api
+        tier: backend
+        color: green
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: scalebotai-api
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: scalebotai-api
+              color: green
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: scalebotai-api
+                    color: green
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      containers:
+        - name: api
+          # Set per release with:
+          #   kubectl -n scalebotai set image deployment/scalebotai-api-green api=<image>:<tag>
+          image: scalebotai/scalebotai-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: scalebotai-config
+            - secretRef:
+                name: scalebotai-secrets
+          env:
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

@@ -1,0 +1,191 @@
+# =============================================================================
+# Canary: Deployment scalebotai-api-canary (1 pod running the NEW version)
+# =============================================================================
+# A canary sends a SMALL share of real traffic to the new version, measures it
+# (error rate, latency, restarts) and only then rolls it out to everyone.
+#
+# Variant A - replica ratio (default, no ingress tricks):
+#   The pod labels include app: scalebotai-api, so the EXISTING Service
+#   scalebotai-api load-balances across 3 stable + 1 canary pod
+#   => ~25% of requests hit the canary (1 / (3+1)).
+#   More canary replicas => bigger share (3 canary + 3 stable = 50%).
+#
+# Variant B - exact weights via ingress-nginx (set-weight.sh):
+#   service-canary.yaml + ingress-canary.yaml route an exact percentage
+#   (10% -> 25% -> 50%) plus header-based routing (X-Canary: always).
+#
+# `track: canary` (instead of track: stable) keeps this Deployment and the base
+# Deployment (selector app + track=stable) from adopting each other's pods, and
+# lets Prometheus split every metric by {track="canary"} vs {track="stable"}.
+# The HPA targets only deployment/scalebotai-api, so the canary stays at a
+# fixed size.
+#
+#   kubectl apply -f k8s/strategies/canary/deployment-canary.yaml
+#   kubectl -n scalebotai set image deployment/scalebotai-api-canary api=<image>:<tag>
+#   kubectl -n scalebotai rollout status deployment/scalebotai-api-canary --timeout=300s
+#   ... observe (README.md PromQL gates) ...
+#   ./k8s/strategies/canary/promote.sh     # or ./abort.sh
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalebotai-api-canary
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.0.0"
+    app: scalebotai-api
+    tier: backend
+    track: canary
+  annotations:
+    kubernetes.io/change-cause: "canary deployment"
+spec:
+  # 1 canary pod next to 3 stable pods = ~25% of Service traffic.
+  replicas: 1
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: scalebotai-api
+      track: canary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalebotai-api
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: api
+        app.kubernetes.io/version: "1.0.0"
+        app: scalebotai-api
+        tier: backend
+        track: canary
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: scalebotai-api
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: scalebotai-api
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: scalebotai-api
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      containers:
+        - name: api
+          # The NEW version under test, set per release with:
+          #   kubectl -n scalebotai set image deployment/scalebotai-api-canary api=<image>:<tag>
+          image: scalebotai/scalebotai-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: scalebotai-config
+            - secretRef:
+                name: scalebotai-secrets
+          env:
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

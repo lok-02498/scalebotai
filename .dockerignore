@@ -1,0 +1,26 @@
+# Keep the build context small and secrets out of images.
+# The API image only needs requirements*.txt and src/ (plus tests for the test stage).
+.git
+.github
+.env
+.env.*
+!.env.example
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+reports
+*.db
+docs
+k8s
+jenkins
+monitoring
+scripts
+tests/load
+docker-compose*.yml
+Makefile
+*.md

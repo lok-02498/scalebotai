@@ -1,0 +1,17 @@
+# Copy of the `logging` Namespace from k8s/base/00-namespaces.yaml so this
+# stack can be applied on its own (`kubectl apply -k k8s/logging`).
+# KEEP IDENTICAL to the base copy. See the base file for why this namespace
+# enforces "privileged" (Filebeat hostPath + Elasticsearch sysctl init) while
+# auditing/warning against "baseline".
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    app.kubernetes.io/name: logging
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/warn-version: latest

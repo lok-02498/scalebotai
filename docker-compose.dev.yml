@@ -1,0 +1,62 @@
+# =============================================================================
+# ScaleBotAI - DEVELOPMENT override (merged on top of docker-compose.yml)
+# -----------------------------------------------------------------------------
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f chatbot-api
+#
+# What changes compared to the production-like stack:
+#   * src/app is BIND-MOUNTED over the code baked into the image, and uvicorn runs
+#     with --reload -> saving a .py file restarts the API in ~1 s (no rebuild).
+#   * LOG_LEVEL=DEBUG, APP_ENV=development.
+#   * The API is published directly on http://127.0.0.1:8000 (bypassing NGINX),
+#     handy for Swagger UI at http://127.0.0.1:8000/docs and debugging.
+#
+# Merge rules (Compose): scalars such as "command" are REPLACED; "environment"
+# is merged key by key; "volumes" are merged by container path; "ports" are appended.
+#
+# NOTE: because a fixed host port is published, do NOT combine this override with
+# `--scale chatbot-api=N` (N > 1) - replicas would fight for 127.0.0.1:8000.
+# Only requirements.txt changes need a rebuild:  ... up -d --build chatbot-api
+# =============================================================================
+
+services:
+  chatbot-api:
+    # --reload watches /app/app (the bind mount). --reload implies a single worker.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+      - --reload-dir
+      - /app/app
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: DEBUG
+      # File-change events do not cross from the Windows/macOS host filesystem into
+      # the Linux VM reliably, so the watcher must poll for changes.
+      WATCHFILES_FORCE_POLLING: "true"
+    volumes:
+      # Live source code (read-only inside the container: the app never writes its code).
+      - type: bind
+        source: ./src/app
+        target: /app/app
+        read_only: true
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  # ---------------------------------------------------------------------------
+  # Optional: publish the databases on localhost to use pgAdmin/DBeaver/RedisInsight
+  # or to run the API directly on the host. Disabled by default because a locally
+  # installed PostgreSQL/Redis often already occupies 5432/6379 on Windows.
+  # ---------------------------------------------------------------------------
+  # postgres:
+  #   ports:
+  #     - "127.0.0.1:5432:5432"
+  # redis:
+  #   ports:
+  #     - "127.0.0.1:6379:6379"

@@ -1,0 +1,261 @@
+# =============================================================================
+# ScaleBotAI - Prometheus recording + alerting rules
+# -----------------------------------------------------------------------------
+# Mounted at /etc/prometheus/alert-rules.yml and referenced from prometheus.yml.
+# Validate locally with:
+#   docker run --rm -v "$PWD/monitoring/prometheus:/cfg" --entrypoint promtool \
+#     prom/prometheus:latest check rules /cfg/alert-rules.yml
+#
+# Thresholds come from the project success criteria:
+#   avg latency < 300 ms | error rate < 1 % | availability 99.9 % |
+#   CPU < 80 % | memory < 80 % (container limits: 1 CPU / 512Mi)
+#
+# Severity convention:
+#   critical -> user-facing SLO breach or component down, act immediately
+#   warning  -> degradation / saturation trend, act within the hour
+#   info     -> worth a look during working hours
+# Runbooks: docs/09-monitoring-logging.md (section "Alerting rules")
+# =============================================================================
+
+groups:
+  # ---------------------------------------------------------------------------
+  # Recording rules: pre-compute expensive / frequently used expressions so the
+  # dashboards and alerts stay cheap and consistent.
+  # Naming: level:metric:operations (Prometheus best practice).
+  # ---------------------------------------------------------------------------
+  - name: scalebotai-recording-rules
+    interval: 15s
+    rules:
+      # Traffic -------------------------------------------------------------
+      - record: job:scalebot_http_requests:rate1m
+        expr: sum by (job) (rate(scalebot_http_requests_total[1m]))
+
+      - record: job_route:scalebot_http_requests:rate1m
+        expr: sum by (job, route) (rate(scalebot_http_requests_total[1m]))
+
+      - record: job:scalebot_http_requests:rate5m
+        expr: sum by (job) (rate(scalebot_http_requests_total[5m]))
+
+      # Errors (5xx = server errors; 4xx are client errors and excluded) ------
+      - record: job:scalebot_http_requests_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(scalebot_http_requests_total{status=~"5.."}[5m]))
+            /
+          sum by (job) (rate(scalebot_http_requests_total[5m]))
+
+      # Latency percentiles from the request-duration histogram --------------
+      - record: job:scalebot_http_request_duration_seconds:p50_5m
+        expr: histogram_quantile(0.50, sum by (job, le) (rate(scalebot_http_request_duration_seconds_bucket[5m])))
+
+      - record: job:scalebot_http_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (job, le) (rate(scalebot_http_request_duration_seconds_bucket[5m])))
+
+      - record: job:scalebot_http_request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(scalebot_http_request_duration_seconds_bucket[5m])))
+
+      - record: job:scalebot_http_request_duration_seconds:avg_5m
+        expr: |
+          sum by (job) (rate(scalebot_http_request_duration_seconds_sum[5m]))
+            /
+          sum by (job) (rate(scalebot_http_request_duration_seconds_count[5m]))
+
+      - record: job_route:scalebot_http_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (job, route, le) (rate(scalebot_http_request_duration_seconds_bucket[5m])))
+
+      # Cache effectiveness ---------------------------------------------------
+      - record: job:scalebot_cache_hit_ratio:rate5m
+        expr: |
+          sum by (job) (rate(scalebot_cache_hits_total[5m]))
+            /
+          (sum by (job) (rate(scalebot_cache_hits_total[5m])) + sum by (job) (rate(scalebot_cache_misses_total[5m])))
+
+      - record: job_cache:scalebot_cache_hit_ratio:rate5m
+        expr: |
+          sum by (job, cache) (rate(scalebot_cache_hits_total[5m]))
+            /
+          (sum by (job, cache) (rate(scalebot_cache_hits_total[5m])) + sum by (job, cache) (rate(scalebot_cache_misses_total[5m])))
+
+      # Saturation ------------------------------------------------------------
+      - record: instance:scalebot_cpu_cores:rate5m
+        expr: rate(process_cpu_seconds_total{job="scalebotai-api"}[5m])
+
+      - record: instance:scalebot_db_pool_utilisation:ratio
+        expr: scalebot_db_pool_checked_out / scalebot_db_pool_size
+
+  # ---------------------------------------------------------------------------
+  # Application alerts
+  # ---------------------------------------------------------------------------
+  - name: scalebotai-api-alerts
+    rules:
+      - alert: ScaleBotAPIDown
+        expr: up{job="scalebotai-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "ScaleBotAI API replica {{ $labels.instance }} is down"
+          description: "Prometheus could not scrape {{ $labels.instance }} (job {{ $labels.job }}) for more than 1 minute."
+          runbook: "Check `docker compose ps chatbot-api` / `kubectl -n scalebotai get pods -l app=scalebotai-api`; read logs (`docker compose logs chatbot-api`, `kubectl logs`); check /health/ready (fails only when PostgreSQL is unreachable - a Redis outage just degrades /health)."
+
+      - alert: ScaleBotAPINoTargets
+        expr: absent(up{job="scalebotai-api"})
+        for: 2m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "No ScaleBotAI API replicas are being scraped"
+          description: "Service discovery returns zero scalebotai-api targets - every replica is gone or DNS/SD is broken. The whole API is likely unavailable."
+          runbook: "Check that chatbot-api containers / the scalebotai-api Deployment exist and are Ready; check the Prometheus /targets page and service discovery config."
+
+      - alert: HighErrorRate
+        expr: job:scalebot_http_requests_errors:ratio_rate5m > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "5xx error rate above 1% ({{ $value | humanizePercentage }})"
+          description: "More than 1% of API requests returned 5xx over the last 5 minutes (SLO: error rate < 1%)."
+          runbook: "Open Kibana index scalebot-error-logs-* (KQL `log_type:error`) to find the failing route; check DB/Redis health, recent deploys (`kubectl rollout history`), and roll back if a release caused it."
+
+      - alert: HighLatencyP95
+        expr: job:scalebot_http_request_duration_seconds:p95_5m > 0.3
+        for: 5m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "P95 latency above 300 ms ({{ $value | humanizeDuration }})"
+          description: "95th percentile API response time has been above 300 ms for 5 minutes."
+          runbook: "Find the slow route in Grafana (P95 by route); check DB pool saturation, Redis hit ratio, CPU throttling and LLM mode (CHATBOT_MODE=llm is much slower). Scale out if CPU-bound."
+
+      - alert: HighAvgLatency
+        expr: job:scalebot_http_request_duration_seconds:avg_5m > 0.3
+        for: 5m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "Average latency above the 300 ms SLO ({{ $value | humanizeDuration }})"
+          description: "Mean API response time over 5 minutes breaches the project success criterion (avg < 300 ms)."
+          runbook: "Same as HighLatencyP95; if every route is slow suspect a shared dependency (PostgreSQL, Redis) or CPU starvation."
+
+      - alert: HighCPU
+        expr: rate(process_cpu_seconds_total{job="scalebotai-api"}[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "API replica {{ $labels.instance }} uses {{ $value | printf \"%.2f\" }} CPU cores"
+          description: "Process CPU above 0.8 cores (80% of the 1-CPU limit) for 5 minutes. The HPA targets 70% of the CPU request."
+          runbook: "Confirm the HPA is scaling (`kubectl -n scalebotai get hpa scalebotai-api`); in compose scale manually (`docker compose up -d --scale chatbot-api=N`). Look for CPU-heavy work (bcrypt on login, regex rules) and throttling."
+
+      - alert: HighMemory
+        expr: process_resident_memory_bytes{job="scalebotai-api"} > 400 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "API replica {{ $labels.instance }} RSS is {{ $value | humanize1024 }}B"
+          description: "Resident memory above 400Mi (~80% of the 512Mi container limit) for 5 minutes - OOMKill risk."
+          runbook: "Check whether memory keeps growing at constant load (leak) or tracks traffic. Compare with python_gc_* metrics; restart the pod to confirm; run the soak test to reproduce."
+
+      - alert: LowCacheHitRatio
+        expr: |
+          job:scalebot_cache_hit_ratio:rate5m < 0.5
+            and on (job)
+          sum by (job) (rate(scalebot_cache_misses_total[5m])) > 0.1
+        for: 15m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "Application cache hit ratio below 50% ({{ $value | humanizePercentage }})"
+          description: "Less than half of cache lookups (bot_response/user/analytics) are hits. More requests reach PostgreSQL and the bot engine."
+          runbook: "Check Redis health and memory (evictions), CACHE_TTL_SECONDS, and whether traffic consists mostly of unique questions (expected for synthetic tests)."
+
+      - alert: DBPoolSaturation
+        expr: max by (job, instance) (scalebot_db_pool_checked_out / scalebot_db_pool_size) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "DB connection pool on {{ $labels.instance }} is {{ $value | humanizePercentage }} used"
+          description: "More than 90% of the SQLAlchemy pool (DB_POOL_SIZE) is checked out; values above 100% mean overflow connections are in use and requests may wait DB_POOL_TIMEOUT."
+          runbook: "Look for slow queries (pg_stat_statements, pg_stat_activity), scale replicas, or tune DB_POOL_SIZE/DB_MAX_OVERFLOW while keeping replicas x (pool + overflow) below max_connections (consider PgBouncer)."
+
+      - alert: RateLimitingSpike
+        expr: sum by (job) (rate(scalebot_rate_limited_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "{{ $value | printf \"%.1f\" }} requests/s are being rate limited"
+          description: "The application is rejecting requests with 429 (RATE_LIMIT_PER_MINUTE). Either abuse/bot traffic or a load test running with default limits."
+          runbook: "Identify the clients in Kibana (`status_code:429` grouped by client_ip / user_id). For planned load tests raise RATE_LIMIT_PER_MINUTE or set RATE_LIMIT_ENABLED=false in the test environment."
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure alerts (exporters)
+  # ---------------------------------------------------------------------------
+  - name: scalebotai-infrastructure-alerts
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "postgres-exporter reports pg_up == 0 on {{ $labels.instance }}; the API readiness probe will fail and chats cannot be stored."
+          runbook: "`docker compose logs postgres` / `kubectl -n scalebotai logs statefulset/postgres`; check disk space on the postgres-data volume/PVC and credentials (POSTGRES_PASSWORD)."
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "Redis is down"
+          description: "redis-exporter reports redis_up == 0. The API fails open (readiness stays green, /health reports degraded): no response cache, no rate limiting, no token denylist - latency and DB load will rise."
+          runbook: "`docker compose logs redis` / `kubectl -n scalebotai logs deploy/redis`; check REDIS_PASSWORD and memory (maxmemory/evictions)."
+
+      - alert: NginxDown
+        expr: nginx_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: scalebotai
+        annotations:
+          summary: "NGINX is down"
+          description: "nginx-exporter cannot read stub_status (nginx_up == 0). The public entry point is probably unavailable."
+          runbook: "`docker compose logs nginx`; validate config with `docker compose exec nginx nginx -t`; check TLS cert generation in the entrypoint."
+
+      - alert: ExporterDown
+        expr: up{job=~"postgres-exporter|redis-exporter|nginx-exporter"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "Exporter {{ $labels.job }} is not reachable"
+          description: "Prometheus cannot scrape {{ $labels.instance }}; infrastructure dashboards and alerts for it are blind."
+          runbook: "Restart the exporter container and check its connection settings (DATA_SOURCE_NAME, REDIS_ADDR, scrape URI)."
+
+      - alert: TooManyPostgresConnections
+        expr: sum(pg_stat_database_numbackends) > 150
+        for: 5m
+        labels:
+          severity: warning
+          team: scalebotai
+        annotations:
+          summary: "PostgreSQL has {{ $value }} open connections"
+          description: "More than 150 backends are connected. The Kubernetes pool (5 + 3 per pod) allows at most 160 from 20 API replicas, so the API is near its ceiling or other clients are holding connections."
+          runbook: "Compare with pg_settings_max_connections; inspect `SELECT state, count(*) FROM pg_stat_activity GROUP BY 1;`. Reduce per-pod pool size or add PgBouncer (transaction pooling)."

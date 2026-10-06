@@ -1,0 +1,31 @@
+question
+Hello
+Hi, what can you help me with?
+help
+What is Docker and why should I use containers?
+How do I write a multi-stage Dockerfile for a Python app?
+What is the difference between a Docker image and a container?
+How do Docker volumes and bind mounts differ?
+What is Kubernetes?
+What is the difference between a Deployment and a StatefulSet in Kubernetes?
+How does the Horizontal Pod Autoscaler work?
+How do readiness and liveness probes work in Kubernetes?
+How do I expose a Kubernetes service with an Ingress?
+What is a Jenkins pipeline?
+How do I write a declarative Jenkinsfile with build, test and deploy stages?
+What is CI/CD and why does it matter?
+How do I roll back a failed Kubernetes deployment?
+What is the difference between git merge and git rebase?
+What is a good Git branching strategy for a small team?
+How do I configure NGINX as a reverse proxy and load balancer?
+How does rate limiting work in NGINX?
+How can Redis be used as a cache for API responses?
+How do I tune PostgreSQL connection pooling?
+What is Prometheus and how does it scrape metrics?
+How do I build a Grafana dashboard for request latency?
+What is the ELK stack used for?
+How do I ship container logs to Elasticsearch with Filebeat?
+What are the cloud service models IaaS, PaaS and SaaS?
+How do I scale a web application to handle a million requests per day?
+What is a blue-green deployment?
+How does a canary release reduce deployment risk?

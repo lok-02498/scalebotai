@@ -1,0 +1,55 @@
+[project]
+name = "scalebotai"
+version = "1.0.0"
+description = "ScaleBotAI: Cloud-Native High-Scale Chatbot Platform (FastAPI backend)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests/unit", "tests/integration"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    # Starlette 1.x nudges TestClient users towards httpx2; httpx still works.
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+# SQLAlchemy's asyncio layer runs DB code inside greenlets; without this,
+# coverage misses everything after the first awaited query.
+concurrency = ["thread", "greenlet"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["tests/load"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "C4", "SIM", "RUF"]
+ignore = [
+    "B008",   # FastAPI uses function calls (Depends/Query) in argument defaults by design
+    "S101",   # assert is fine in tests
+    "S104",   # binding to 0.0.0.0 is intended inside containers
+    "RUF012", # mutable class attributes are fine for constant tables
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S311"]
+# token_type="access"/"refresh" and documented change-me placeholders are not secrets.
+"src/app/core/{config,security}.py" = ["S105"]
+"src/app/schemas/auth.py" = ["S105"]
+"src/app/services/user_service.py" = ["S106"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.bandit]
+exclude_dirs = ["tests"]

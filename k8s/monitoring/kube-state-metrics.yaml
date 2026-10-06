@@ -1,0 +1,150 @@
+# =============================================================================
+# kube-state-metrics (KSM) — Kubernetes OBJECT state as Prometheus metrics
+# =============================================================================
+# metrics-server  -> live CPU/memory usage for `kubectl top` and the HPA
+#                    (in-memory, not for Prometheus).
+# cAdvisor        -> container resource usage (scraped from kubelets).
+# kube-state-metrics -> the STATE of API objects, e.g.
+#   kube_pod_container_status_restarts_total
+#   kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}
+#   kube_deployment_status_replicas_available
+#   kube_horizontalpodautoscaler_status_current_replicas / _spec_max_replicas
+# The alerts PodCrashLooping and HPAMaxedOut depend on it.
+#
+# This is a trimmed, restricted-PSS-compliant install that only watches the
+# resource types we alert/dashboard on (--resources), so its RBAC stays small.
+# Full upstream install alternative (kube-system namespace):
+#   helm install ksm prometheus-community/kube-state-metrics -n kube-system
+# (then change the scrape target in prometheus-config.yaml accordingly).
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: kube-state-metrics
+automountServiceAccountToken: true   # it lists/watches the Kubernetes API
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-state-metrics-scalebotai
+  labels:
+    app.kubernetes.io/name: kube-state-metrics
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "nodes", "persistentvolumeclaims", "pods"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments", "replicasets", "statefulsets"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-state-metrics-scalebotai
+  labels:
+    app.kubernetes.io/name: kube-state-metrics
+subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: monitoring
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-state-metrics-scalebotai
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: monitoring
+  labels:
+    app: kube-state-metrics
+    app.kubernetes.io/name: kube-state-metrics
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-state-metrics
+        app.kubernetes.io/name: kube-state-metrics
+      # NO prometheus.io/scrape annotation: it is scraped by the dedicated
+      # `kube-state-metrics` job (honor_labels: true) instead of the pod job.
+    spec:
+      serviceAccountName: kube-state-metrics
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.15.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8080
+            - --telemetry-port=8081
+            - --resources=daemonsets,deployments,horizontalpodautoscalers,namespaces,nodes,persistentvolumeclaims,poddisruptionbudgets,pods,replicasets,statefulsets
+          ports:
+            - name: http-metrics
+              containerPort: 8080
+            - name: telemetry
+              containerPort: 8081
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http-metrics
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: telemetry
+            initialDelaySeconds: 5
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: monitoring
+  labels:
+    app: kube-state-metrics
+    app.kubernetes.io/name: kube-state-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: kube-state-metrics
+  ports:
+    - name: http-metrics
+      port: 8080
+      targetPort: http-metrics
+    - name: telemetry
+      port: 8081
+      targetPort: telemetry

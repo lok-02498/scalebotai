@@ -1,0 +1,40 @@
+# =============================================================================
+# 10-pdb.yaml — PodDisruptionBudget for the API
+# =============================================================================
+# Disruptions come in two kinds:
+#   * INVOLUNTARY: node crash, kernel panic, OOM, cloud VM deleted. A PDB can't
+#     prevent these — replicas + anti-affinity + probes handle them.
+#   * VOLUNTARY: `kubectl drain` (node upgrade/maintenance), cluster-autoscaler
+#     scale-down, node pool rotation. These go through the EVICTION API, and
+#     the eviction API respects PDBs.
+#
+# minAvailable: 2 => an eviction is refused if it would leave fewer than 2
+# Ready API pods. With 3 replicas, a drain evicts one pod, waits for its
+# replacement to become Ready elsewhere, then evicts the next one.
+# => node maintenance with zero downtime.
+#
+# Do NOT set minAvailable equal to replicas (e.g. 3 of 3): then no pod can ever
+# be evicted and `kubectl drain` hangs forever.
+#
+# Note: rolling updates are NOT governed by PDBs (they use maxUnavailable).
+# =============================================================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: scalebotai-api
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: availability
+    app: scalebotai-api
+spec:
+  minAvailable: 2
+  # Matches every API pod regardless of track/color (stable, canary, blue,
+  # green), so the budget keeps working in all deployment-strategy modes.
+  selector:
+    matchLabels:
+      app: scalebotai-api
+  # Pods that are Running but NOT Ready (e.g. crash-looping) may always be
+  # evicted, so a broken pod can never block a node drain. (policy/v1, GA in
+  # Kubernetes 1.31; available since 1.27.)
+  unhealthyPodEvictionPolicy: AlwaysAllow

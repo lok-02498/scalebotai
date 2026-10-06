@@ -1,0 +1,102 @@
+# =============================================================================
+# ScaleBotAI - Prometheus configuration (Docker Compose stack)
+# -----------------------------------------------------------------------------
+# Mounted by docker-compose.yml at /etc/prometheus/prometheus.yml.
+# The alert/recording rules live next to it and are mounted at
+# /etc/prometheus/alert-rules.yml.
+#
+# What gets scraped (all on the `monitoring` network):
+#   * prometheus         - Prometheus itself (localhost:9090)
+#   * scalebotai-api     - every replica of the `chatbot-api` service, discovered via
+#                          Docker's embedded DNS (A records), so
+#                          `docker compose up --scale chatbot-api=3` is picked up
+#                          automatically without editing this file.
+#   * postgres-exporter  - PostgreSQL metrics      (pg_*)
+#   * redis-exporter     - Redis metrics           (redis_*)
+#   * nginx-exporter     - NGINX stub_status       (nginx_*)
+#
+# Kubernetes uses its own Prometheus config (k8s/ manifests, pod annotations
+# prometheus.io/scrape|port|path). Keep the job name `scalebotai-api` there too:
+# the alert rules and Grafana dashboards filter on it.
+#
+# Optional: to receive k6 metrics (k6 -o experimental-prometheus-rw) start
+# Prometheus with --web.enable-remote-write-receiver (see tests/load/k6/README.md).
+# =============================================================================
+
+global:
+  scrape_interval: 15s        # how often targets are scraped
+  scrape_timeout: 10s         # must be <= scrape_interval
+  evaluation_interval: 15s    # how often recording/alerting rules are evaluated
+  external_labels:
+    project: scalebotai
+    stack: docker-compose
+
+# Recording + alerting rules (path as mounted inside the container).
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+# No Alertmanager ships with the compose stack; alerts are visible at
+# http://localhost:9090/alerts and in Grafana. To route them (Slack/e-mail),
+# add an alertmanager service and uncomment:
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # Prometheus self-monitoring
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ---------------------------------------------------------------------------
+  # ScaleBotAI FastAPI replicas.
+  # dns_sd_configs type A resolves `chatbot-api` to ONE IP PER CONTAINER, so all
+  # scaled replicas become separate targets (instance = <container-ip>:8000).
+  # Each replica runs a single uvicorn worker, so per-process metrics
+  # (process_cpu_seconds_total, process_resident_memory_bytes) are per replica.
+  # ---------------------------------------------------------------------------
+  - job_name: scalebotai-api
+    metrics_path: /metrics
+    scheme: http
+    dns_sd_configs:
+      - names: ['chatbot-api']
+        type: A
+        port: 8000
+        refresh_interval: 15s   # re-resolve so new/removed replicas are noticed quickly
+    relabel_configs:
+      # Static labels that make dashboards/alerts easier to read.
+      - target_label: service
+        replacement: scalebotai-api
+      - target_label: platform
+        replacement: docker-compose
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL exporter (prometheus-community/postgres_exporter)
+  # ---------------------------------------------------------------------------
+  - job_name: postgres-exporter
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          service: postgres
+
+  # ---------------------------------------------------------------------------
+  # Redis exporter (oliver006/redis_exporter)
+  # ---------------------------------------------------------------------------
+  - job_name: redis-exporter
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: redis
+
+  # ---------------------------------------------------------------------------
+  # NGINX exporter (nginx/nginx-prometheus-exporter) - reads the internal
+  # stub_status page (nginx:8080/nginx_status) and exposes nginx_* metrics.
+  # ---------------------------------------------------------------------------
+  - job_name: nginx-exporter
+    static_configs:
+      - targets: ['nginx-exporter:9113']
+        labels:
+          service: nginx

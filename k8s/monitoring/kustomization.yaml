@@ -1,0 +1,38 @@
+# =============================================================================
+# k8s/monitoring — Prometheus + Grafana + kube-state-metrics
+# =============================================================================
+#   kubectl apply -k k8s/monitoring
+#   kubectl -n monitoring get pods,svc,pvc
+#   kubectl -n monitoring port-forward svc/prometheus 9090:9090
+#   kubectl -n monitoring port-forward svc/grafana 3000:3000
+#
+# Prerequisites: the API pods carry prometheus.io/* annotations
+# (k8s/base/06-api-deployment.yaml) and the scalebotai NetworkPolicy
+# `allow-api-ingress` lets the monitoring namespace reach port 8000.
+# Optional: load Grafana dashboards from the repo (see grafana-config.yaml).
+#
+# Every manifest sets metadata.namespace explicitly; no top-level
+# `namespace:` (it would also rename the Namespace object and interfere with
+# ClusterRoleBinding subjects).
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespace.yaml
+  - prometheus-rbac.yaml
+  - prometheus-config.yaml
+  - prometheus-rules.yaml
+  - prometheus.yaml
+  - kube-state-metrics.yaml
+  - grafana-secret.yaml
+  - grafana-config.yaml
+  - grafana.yaml
+
+# Same common labels as k8s/base (keeps the shared Namespace object identical).
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: scalebotai
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+    includeTemplates: false

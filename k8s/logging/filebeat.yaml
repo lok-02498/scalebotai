@@ -1,0 +1,196 @@
+# =============================================================================
+# Filebeat 8.15 DaemonSet — node-level log shipper (namespace logging)
+# =============================================================================
+# DaemonSet = exactly ONE pod per node (new nodes get one automatically).
+# That is the right pattern for log collection: the container runtime writes
+# every container's stdout/stderr to files on the node:
+#   /var/log/containers/<pod>_<namespace>_<container>-<id>.log   (symlinks)
+#     -> /var/log/pods/<namespace>_<pod>_<uid>/<container>/0.log
+#        (-> /var/lib/docker/containers/<id>/<id>-json.log with the Docker runtime)
+# so the app just logs JSON to stdout (12-factor) and needs no sidecar, no
+# shared volume and no log library talking to Logstash.
+#
+# Why it needs host access (=> logging namespace is "privileged"):
+#   * hostPath mounts of the node's log directories (read-only)
+#   * runs as root because those files are owned by root (0640)
+#   * hostPath /var/lib/filebeat-data stores the registry (read offsets), so a
+#     restarted Filebeat continues where it stopped instead of re-shipping.
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: filebeat
+  namespace: logging
+  labels:
+    app.kubernetes.io/name: filebeat
+---
+# add_kubernetes_metadata looks up pod -> labels/namespace/node via the API.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: filebeat-scalebotai
+  labels:
+    app.kubernetes.io/name: filebeat
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: filebeat-scalebotai
+  labels:
+    app.kubernetes.io/name: filebeat
+subjects:
+  - kind: ServiceAccount
+    name: filebeat
+    namespace: logging
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: filebeat-scalebotai
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: filebeat-config
+  namespace: logging
+  labels:
+    app.kubernetes.io/name: filebeat
+data:
+  filebeat.yml: |-
+    filebeat.inputs:
+      - type: filestream
+        id: scalebotai-api-container-logs
+        # Only the API pods: matches scalebotai-api-*, scalebotai-api-canary-*,
+        # scalebotai-api-blue-*, scalebotai-api-green-* (pod name is the
+        # first part of the file name).
+        paths:
+          - /var/log/containers/*scalebotai-api*.log
+        # /var/log/containers entries are symlinks.
+        prospector.scanner.symlinks: true
+        parsers:
+          # Unwraps the runtime format (Docker json-file or CRI) so `message`
+          # holds the app's original JSON line; adds `stream` (stdout/stderr).
+          - container: ~
+        processors:
+          # Enrich every event with kubernetes.namespace, kubernetes.pod.name,
+          # kubernetes.labels.* (app, track, color ...), kubernetes.node.name.
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+                - logs_path:
+                    logs_path: "/var/log/containers/"
+              # Only pods/namespaces/nodes are granted in RBAC; don't look up
+              # owning Deployments/CronJobs.
+              add_resource_metadata:
+                deployment: false
+                cronjob: false
+
+    processors:
+      - drop_fields:
+          fields: ["agent.ephemeral_id", "agent.id", "agent.version", "log.file.device_id", "log.file.inode"]
+          ignore_missing: true
+
+    output.logstash:
+      # Cross-namespace DNS name of the Logstash Service.
+      hosts: ["logstash.logging.svc:5044"]
+      # Retry/backpressure is built in: if Logstash is down, Filebeat keeps
+      # its read offset and resends later (at-least-once delivery).
+
+    # Filebeat's own logs to stderr (visible with kubectl logs).
+    logging.level: info
+    logging.to_stderr: true
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: filebeat
+  namespace: logging
+  labels:
+    app: filebeat
+    app.kubernetes.io/name: filebeat
+    app.kubernetes.io/component: log-shipper
+    app.kubernetes.io/version: "8.15.3"
+spec:
+  selector:
+    matchLabels:
+      app: filebeat
+  # Replace Filebeat pods node by node on config/image changes.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: filebeat
+        app.kubernetes.io/name: filebeat
+    spec:
+      serviceAccountName: filebeat
+      terminationGracePeriodSeconds: 30
+      # Also collect logs on control-plane nodes (minikube's only node is one).
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: filebeat
+          image: docker.elastic.co/beats/filebeat:8.15.3
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/filebeat.yml", "-e"]
+          env:
+            # Node this pod runs on (used by add_kubernetes_metadata).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            runAsUser: 0            # read root-owned log files
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            privileged: false       # root, but NOT a privileged container
+          resources:
+            requests:
+              cpu: 50m
+              memory: 100Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/filebeat.yml
+              subPath: filebeat.yml
+              readOnly: true
+            - name: data
+              mountPath: /usr/share/filebeat/data
+            - name: varlogcontainers
+              mountPath: /var/log/containers
+              readOnly: true
+            - name: varlogpods
+              mountPath: /var/log/pods
+              readOnly: true
+            # Needed when the node uses the Docker runtime (minikube default).
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: filebeat-config
+            # Filebeat refuses config files writable by group/others.
+            defaultMode: 0640
+        - name: varlogcontainers
+          hostPath:
+            path: /var/log/containers
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: data
+          hostPath:
+            path: /var/lib/filebeat-data
+            type: DirectoryOrCreate

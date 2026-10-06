@@ -1,0 +1,101 @@
+# =============================================================================
+# ScaleBotAI - Filebeat reference configuration (Kubernetes)
+# -----------------------------------------------------------------------------
+# Runs as a DaemonSet in the `logging` namespace (one Filebeat per node) and
+# ships the stdout of every ScaleBotAI API container to Logstash, which writes
+# the scalebot-{log_type}-logs-YYYY.MM.dd indices in Elasticsearch.
+#
+# Typical deployment: store this file in a ConfigMap `filebeat-config`
+# (key filebeat.yml) mounted at /usr/share/filebeat/filebeat.yml, and mount the
+# node's /var/log and /var/lib/docker/containers (or /var/log/pods) read-only.
+# Filebeat needs a ServiceAccount + ClusterRole (get/list/watch pods, nodes,
+# namespaces) for add_kubernetes_metadata, and NODE_NAME from the downward API:
+#   env:
+#     - name: NODE_NAME
+#       valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+#
+# Not used by Docker Compose: there, Logstash tails /var/log/scalebotai/*.log
+# directly from the shared app-logs volume.
+# Tested against Filebeat 8.x (docker.elastic.co/beats/filebeat:8.15.x).
+# =============================================================================
+
+filebeat.inputs:
+  # Container log files written by the kubelet / container runtime.
+  # File names look like <pod>_<namespace>_<container>-<container-id>.log,
+  # so the glob only picks up the scalebotai-api pods.
+  - type: container
+    id: scalebotai-api-containers
+    paths:
+      - /var/log/containers/*scalebotai-api*.log
+    stream: all                 # stdout + stderr
+    # Python tracebacks are already inside the JSON (exc_info), so no multiline
+    # handling is needed; plain-text lines (e.g. uvicorn boot) are shipped as-is.
+
+  # Filebeat 9.x removed the `container` input by default - use filestream instead:
+  # - type: filestream
+  #   id: scalebotai-api-containers
+  #   paths:
+  #     - /var/log/containers/*scalebotai-api*.log
+  #   parsers:
+  #     - container:
+  #         stream: all
+  #   prospector.scanner.symlinks: true
+
+processors:
+  # Adds kubernetes.namespace, kubernetes.pod.name, kubernetes.labels.*,
+  # kubernetes.container.name ... by matching the log file path.
+  - add_kubernetes_metadata:
+      host: ${NODE_NAME}
+      default_indexers.enabled: true
+      default_matchers.enabled: false
+      matchers:
+        - logs_path:
+            logs_path: "/var/log/containers/"
+
+  # The app logs one JSON object per line: expand it into the event root so
+  # level, log_type, route, status_code, latency_ms ... become real fields.
+  # The JSON @timestamp replaces Filebeat's read time.
+  - decode_json_fields:
+      fields: ["message"]
+      target: ""
+      overwrite_keys: true
+      add_error_key: true
+      max_depth: 2
+      process_array: false
+
+  # Only keep events from the application namespace (defensive; the path glob
+  # already filters).
+  - drop_event:
+      when:
+        not:
+          equals:
+            kubernetes.namespace: "scalebotai"
+
+  # Fields that only add noise / storage.
+  - drop_fields:
+      ignore_missing: true
+      fields:
+        - "kubernetes.node.uid"
+        - "kubernetes.pod.uid"
+        - "kubernetes.replicaset.name"
+        - "kubernetes.namespace_uid"
+        - "agent.ephemeral_id"
+        - "ecs.version"
+
+# Ship to Logstash (beats input on port 5044) in the `logging` namespace.
+output.logstash:
+  hosts: ["logstash.logging.svc:5044"]
+  loadbalance: true
+  bulk_max_size: 2048
+  worker: 1
+  # ssl.certificate_authorities: ["/etc/filebeat/certs/ca.crt"]   # enable TLS in production
+
+# Filebeat's own logs and monitoring
+logging.level: info
+logging.to_stderr: true
+monitoring.enabled: false
+
+# Expose Filebeat metrics locally (curl http://localhost:5066/stats) for debugging.
+http.enabled: true
+http.host: 0.0.0.0
+http.port: 5066

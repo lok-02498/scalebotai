@@ -1,0 +1,35 @@
+# =============================================================================
+# ScaleBotAI - Logstash settings
+# Mounted at /usr/share/logstash/config/logstash.yml.
+# The pipeline itself is monitoring/logstash/pipeline/logstash.conf, mounted into
+# /usr/share/logstash/pipeline/ (the image's default pipelines.yml reads that dir).
+# =============================================================================
+
+# HTTP API (node stats: curl http://localhost:9600/_node/stats/pipelines?pretty)
+# (`api.http.host` is the Logstash 8 name of the older `http.host` setting)
+api.http.host: "0.0.0.0"
+api.http.port: 9600
+
+node.name: scalebotai-logstash
+path.data: /usr/share/logstash/data
+
+# Pipeline tuning: workers default to the number of CPU cores; 2 is plenty for
+# the local stack. Raise workers/batch.size if the event rate grows (k8s).
+pipeline.workers: 2
+pipeline.batch.size: 250
+pipeline.batch.delay: 50
+pipeline.ordered: auto
+
+# Keep the plain field layout the app emits (no automatic ECS renaming such as
+# host -> host.name). The pipeline normalises the few fields that differ
+# between the file input (compose) and the beats input (k8s).
+pipeline.ecs_compatibility: disabled
+
+# Reload logstash.conf automatically when it changes on disk.
+config.reload.automatic: true
+config.reload.interval: 30s
+
+# Do not ship Logstash's own monitoring data to Elasticsearch (local dev).
+xpack.monitoring.enabled: false
+
+log.level: info

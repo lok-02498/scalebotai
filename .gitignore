@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+reports/
+*.db
+
+# Secrets and local state
+.env
+*.pem
+*.key
+*.crt
+.deploy-state
+kubeconfig*
+
+# Load-test output (keep the empty results/ folders)
+tests/load/*/results/*
+!tests/load/*/results/.gitkeep
+tests/load/jmeter/results*/
+tests/load/jmeter/report/
+*.jtl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

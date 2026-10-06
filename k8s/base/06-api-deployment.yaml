@@ -1,0 +1,270 @@
+# =============================================================================
+# 06-api-deployment.yaml — the ScaleBotAI FastAPI backend
+# =============================================================================
+# Deployment -> manages ReplicaSets -> which manage Pods.
+#   * The ReplicaSet controller keeps EXACTLY `replicas` pods alive (self-
+#     healing: a crashed/deleted/evicted pod is replaced within seconds).
+#   * The Deployment controller adds versioning on top: every change to
+#     .spec.template creates a NEW ReplicaSet and shifts pods from the old one
+#     to the new one according to `strategy` (rolling update), keeping old
+#     ReplicaSets (revisionHistoryLimit) so `kubectl rollout undo` is instant.
+#
+# Names used by Jenkins / scripts/deploy.sh — do not rename:
+#   Deployment scalebotai-api, container "api", port name "http" (8000).
+#   kubectl -n scalebotai set image deployment/scalebotai-api api=<image>:<tag>
+#   kubectl -n scalebotai rollout status deployment/scalebotai-api --timeout=300s
+#   kubectl -n scalebotai rollout undo deployment/scalebotai-api
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scalebotai-api
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "1.0.0"
+    app: scalebotai-api
+    tier: backend
+    track: stable
+  annotations:
+    # Shown in the CHANGE-CAUSE column of `kubectl rollout history`.
+    # Jenkins overwrites it on each deploy:
+    #   kubectl annotate deployment/scalebotai-api kubernetes.io/change-cause="build 42 (abc1234)" --overwrite
+    kubernetes.io/change-cause: "initial deployment of scalebotai-api 1.0.0"
+spec:
+  # Requirement: 3 replicas = survives the loss of one pod (or node) while still
+  # satisfying the PodDisruptionBudget (minAvailable 2).
+  # NOTE: the HPA (09-hpa.yaml) owns the replica count at runtime. Every
+  # `kubectl apply -k k8s/base` resets it to 3 until the HPA reacts again
+  # (seconds). Many teams delete this field once an HPA exists; Jenkins uses
+  # `kubectl set image`, which never touches replicas.
+  replicas: 3
+  # Keep the last 10 ReplicaSets -> `kubectl rollout undo --to-revision=N`.
+  revisionHistoryLimit: 10
+  # A new pod must stay Ready for 10 s before it counts as "available". This
+  # catches pods that pass readiness once and then crash, and slows a bad
+  # rollout down before it replaces all healthy pods.
+  minReadySeconds: 10
+  # If the rollout makes no progress for 10 min the Deployment is marked
+  # Failed (ProgressDeadlineExceeded) and `rollout status` exits non-zero ->
+  # Jenkins triggers the rollback stage.
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Up to 25% EXTRA pods during the update (3 replicas -> +1 pod).
+      maxSurge: 25%
+      # ZERO pods may be unavailable: an old pod is only terminated after its
+      # replacement is Ready (+minReadySeconds). => zero-downtime deploys.
+      maxUnavailable: 0
+  # IMMUTABLE after creation. `track: stable` keeps this Deployment from
+  # adopting the canary pods (track: canary) that share `app: scalebotai-api`
+  # and are therefore load-balanced by the same Service.
+  selector:
+    matchLabels:
+      app: scalebotai-api
+      track: stable
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scalebotai-api
+        app.kubernetes.io/part-of: scalebotai
+        app.kubernetes.io/component: api
+        # Read back into APP_VERSION via the downward API (see env below).
+        # To publish a new version string in the same rollout as a new image:
+        #   kubectl -n scalebotai patch deployment scalebotai-api -p \
+        #     '{"spec":{"template":{"metadata":{"labels":{"app.kubernetes.io/version":"42-abc1234"}}}}}'
+        app.kubernetes.io/version: "1.0.0"
+        app: scalebotai-api
+        tier: backend
+        track: stable
+      annotations:
+        # Prometheus pod discovery (k8s/monitoring) keeps pods with
+        # scrape=true and scrapes http://<podIP>:<port><path>.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Dedicated identity (11-rbac.yaml). The API never calls the Kubernetes
+      # API, so no token is mounted (smaller attack surface).
+      serviceAccountName: scalebotai-api
+      automountServiceAccountToken: false
+      # Without this, kubelet injects Docker-link style variables for every
+      # Service in the namespace, e.g. REDIS_PORT=tcp://10.96.12.4:6379 and
+      # POSTGRES_PORT=tcp://..., which COLLIDE with our own config names.
+      # (Explicit env/envFrom win, but disabling it removes the trap entirely.)
+      enableServiceLinks: false
+      # Graceful shutdown budget. Sequence on pod deletion:
+      #  1. pod marked Terminating -> removed from Service endpoints
+      #     (asynchronously, ingress-nginx/kube-proxy need a moment to notice)
+      #  2. preStop hook runs: sleep 5 -> keeps serving in-flight AND late-
+      #     arriving requests while endpoints propagate (connection draining)
+      #  3. SIGTERM -> uvicorn stops accepting, finishes open requests, exits
+      #  4. after 30 s total, SIGKILL if still running
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true       # kubelet refuses to start the container as uid 0
+        runAsUser: 10001         # "appuser" created in docker/api/Dockerfile
+        runAsGroup: 10001
+        fsGroup: 10001           # group ownership of mounted volumes
+        seccompProfile:
+          type: RuntimeDefault   # block ~40+ dangerous syscalls (required by "restricted")
+      # --- Spread replicas so one node/zone failure cannot take all of them ---
+      topologySpreadConstraints:
+        # Spread across nodes: pod counts per node may differ by at most 1.
+        # ScheduleAnyway = soft preference, so a 1-node minikube still works.
+        # (Use DoNotSchedule on a real multi-node cluster for a hard rule.)
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: scalebotai-api
+        # Spread across availability zones (label set by cloud providers).
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: scalebotai-api
+      affinity:
+        podAntiAffinity:
+          # "Prefer not to put two API pods on the same node" (soft, weight
+          # 1-100). requiredDuringScheduling... would make it a hard rule, but
+          # then replicas > nodes would stay Pending.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: scalebotai-api
+      # Faster failover when a NODE dies. By default pods tolerate the
+      # not-ready/unreachable taints for 300 s before being evicted and
+      # recreated elsewhere; a stateless API can move after 30 s.
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+      containers:
+        - name: api
+          # Placeholder; CI replaces it with an immutable tag
+          # (<DOCKERHUB_USER>/scalebotai-api:<BUILD_NUMBER>-<sha>) via
+          # `kubectl set image` or `kustomize edit set image` (kustomization.yaml).
+          image: scalebotai/scalebotai-api:latest
+          # IfNotPresent: use the node's cached image if present. Needed for
+          # minikube (`minikube image load`), and correct with immutable CI
+          # tags. (With the tag `latest` the default would be Always.)
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          # All keys of the ConfigMap and the Secret become env vars.
+          envFrom:
+            - configMapRef:
+                name: scalebotai-config
+            - secretRef:
+                name: scalebotai-secrets
+          # Downward API: expose pod metadata to the app (appears in logs,
+          # /api/v1/admin/system and lets you see WHICH pod answered).
+          # Explicit `env` entries override same-named `envFrom` keys.
+          env:
+            - name: APP_VERSION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['app.kubernetes.io/version']
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # requests: guaranteed share used by the SCHEDULER and as the 100%
+          #   reference for HPA utilisation (70% CPU target = 175m per pod).
+          # limits: hard caps. CPU over the limit is THROTTLED; memory over the
+          #   limit gets the container OOMKilled (and restarted).
+          # requests < limits => QoS class "Burstable".
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # ---- Probes ----------------------------------------
+          # startupProbe: protects slow starts (DB connect, table creation,
+          # admin bootstrap). Liveness/readiness are paused until it succeeds;
+          # allows up to 24 x 5s = 120 s.
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          # livenessProbe: "is the PROCESS alive?" — no dependency checks, so a
+          # Postgres outage does NOT cause a restart storm. 3 failures (30 s)
+          # => kubelet restarts the container.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # readinessProbe: "can it serve traffic NOW?" — 503 unless the
+          # database answers. Redis is reported but does NOT gate readiness:
+          # the app fails open without Redis, and marking every pod unready
+          # during a cache outage would turn a degradation into an outage.
+          # Failing pods are only REMOVED from the Service endpoints (not
+          # restarted) and come back automatically when healthy again. Rolling
+          # updates wait for new pods to become Ready.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 1
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Connection draining (see terminationGracePeriodSeconds above).
+              # On Kubernetes >= 1.30 the image-independent form is:
+              #   preStop: { sleep: { seconds: 5 } }
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            allowPrivilegeEscalation: false   # blocks setuid binaries / no_new_privs
+            readOnlyRootFilesystem: true      # attacker cannot modify the app or drop tools
+            privileged: false
+            capabilities:
+              drop: ["ALL"]                   # port 8000 > 1024 needs no capability
+          volumeMounts:
+            # The only writable path: Python/uvicorn temp files.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            # emptyDir lives as long as the pod; sizeLimit evicts the pod if a
+            # bug fills it (protects the node's disk).
+            sizeLimit: 64Mi

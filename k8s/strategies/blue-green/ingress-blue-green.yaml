@@ -1,0 +1,103 @@
+# =============================================================================
+# Blue-green Ingress: public host -> scalebotai-api-active
+# =============================================================================
+# This REPLACES the base Ingress object of the same name
+# (k8s/base/08-ingress.yaml, `scalebotai-ingress`): `kubectl apply` updates it
+# in place, so api.scalebotai.local now routes to the ACTIVE colour instead of
+# the base Service. Same host, TLS and annotations; only the backend changes.
+# Using the same object name avoids two Ingresses claiming the same
+# host+path (ingress-nginx would then pick one arbitrarily).
+#
+# Back to rolling mode:  kubectl apply -f k8s/base/08-ingress.yaml
+#
+# The second Ingress exposes the IDLE colour at preview.api.scalebotai.local,
+# restricted to private networks, for manual/automated checks before switching.
+# Add "<minikube ip> preview.api.scalebotai.local" to your hosts file to use it.
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scalebotai-ingress
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: ingress
+    app: scalebotai-api
+    strategy: blue-green
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "error timeout http_502 http_503 http_504"
+    nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.scalebotai.local
+      secretName: scalebotai-tls
+  rules:
+    - host: api.scalebotai.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api-active
+                port:
+                  name: http
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api-active
+                port:
+                  name: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: scalebotai-ingress-preview
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/component: ingress
+    app: scalebotai-api
+    strategy: blue-green
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Testers / CI only — never the public internet.
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.1/32"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - preview.api.scalebotai.local
+      secretName: scalebotai-tls     # the self-signed cert includes this SAN
+  rules:
+    - host: preview.api.scalebotai.local
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api-preview
+                port:
+                  name: http
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: scalebotai-api-preview
+                port:
+                  name: http

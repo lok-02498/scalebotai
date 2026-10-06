@@ -1,0 +1,41 @@
+# =============================================================================
+# Blue-green: the ACTIVE Service (receives all user traffic)
+# =============================================================================
+# The whole blue-green switch is ONE field: spec.selector.color.
+#   color: blue  -> users hit scalebotai-api-blue pods
+#   color: green -> users hit scalebotai-api-green pods
+# switch.sh patches it; EndpointSlices update within about a second and
+# ingress-nginx picks up the new pod IPs without reloading. Both colours are
+# already running and Ready, so the cut-over drops no requests (in-flight
+# requests on the old colour complete normally — those pods keep running).
+#
+# Rollback = patch the selector back (seconds). The old colour is still warm.
+#
+# Initial state: blue is active. Check the current colour with
+#   kubectl -n scalebotai get svc scalebotai-api-active -o jsonpath='{.spec.selector.color}'
+#
+# NOTE: re-applying this file resets the selector to blue. After the first
+# switch, use switch.sh (or kubectl patch) — never re-apply blindly.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: scalebotai-api-active
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app.kubernetes.io/part-of: scalebotai
+    app.kubernetes.io/component: api
+    app: scalebotai-api
+    role: active
+spec:
+  type: ClusterIP
+  selector:
+    app: scalebotai-api
+    color: blue
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+      appProtocol: http

@@ -1,0 +1,56 @@
+# =============================================================================
+# ScaleBotAI - Jenkins controller (local / lab setup)
+#
+#   docker compose -f jenkins/docker-compose.jenkins.yml up -d --build
+#   docker exec scalebotai-jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+#   open http://localhost:8080
+#
+# SECURITY TRADE-OFF - host Docker socket
+#   /var/run/docker.sock is mounted so pipeline `docker build/push` and `trivy image` use the
+#   host daemon (fast, shares the layer cache, no privileged Docker-in-Docker). Anyone who can
+#   run a job on this Jenkins can control the host Docker daemon, which is ROOT-EQUIVALENT on
+#   the host. Acceptable for a single-user lab; in production use dedicated build agents
+#   (ephemeral VMs or Kubernetes pods), rootless BuildKit/Kaniko, or TLS-protected
+#   Docker-in-Docker, and restrict who may run or modify pipelines. See jenkins/README.md.
+#
+# Variables (shell env or a .env file next to this compose file)
+#   DOCKER_GID    group id owning /var/run/docker.sock
+#                 Linux: export DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+#                 Docker Desktop (Windows/macOS): 0 (default)
+#   MINIKUBE_IP   IP that api.scalebotai.local resolves to inside Jenkins (default 192.168.49.2,
+#                 the minikube docker-driver node; see `minikube ip`)
+#   JENKINS_PORT  host port for the UI (default 8080)
+# =============================================================================
+name: scalebotai-jenkins
+
+services:
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scalebotai/jenkins:lts-jdk17
+    container_name: scalebotai-jenkins
+    restart: unless-stopped
+    ports:
+      - "${JENKINS_PORT:-8080}:8080"    # web UI + /github-webhook/
+      - "50000:50000"                   # inbound agents (JNLP)
+    environment:
+      JAVA_OPTS: "-Xms512m -Xmx2g -Djava.awt.headless=true -Dhudson.model.DirectoryBrowserSupport.CSP="
+      TZ: "UTC"
+    volumes:
+      - jenkins-home:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock   # see SECURITY TRADE-OFF above
+    group_add:
+      - "${DOCKER_GID:-0}"
+    # Last resort if the socket permissions cannot be matched (lab use only):
+    # user: root
+    extra_hosts:
+      - "api.scalebotai.local:${MINIKUBE_IP:-192.168.49.2}"
+      - "host.docker.internal:host-gateway"
+    # To reach the minikube API server / Ingress (docker driver), attach Jenkins to the
+    # `minikube` network once minikube is running:
+    #   docker network connect minikube scalebotai-jenkins
+
+volumes:
+  jenkins-home:
+    name: scalebotai-jenkins-home

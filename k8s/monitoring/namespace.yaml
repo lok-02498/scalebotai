@@ -1,0 +1,16 @@
+# Copy of the `monitoring` Namespace from k8s/base/00-namespaces.yaml so this
+# stack can be applied on its own (`kubectl apply -k k8s/monitoring`).
+# KEEP IDENTICAL to the base copy (kubectl apply removes labels that are
+# missing from the most recently applied manifest).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    app.kubernetes.io/name: monitoring
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

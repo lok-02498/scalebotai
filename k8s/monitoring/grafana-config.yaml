@@ -1,0 +1,84 @@
+# =============================================================================
+# Grafana provisioning ("configuration as code")
+# =============================================================================
+# Grafana reads YAML files from /etc/grafana/provisioning/* at startup and
+# creates datasources / dashboard providers from them — no clicking in the UI,
+# reproducible on every fresh pod. Because everything is provisioned, the
+# Grafana pod can be stateless (emptyDir), see grafana.yaml.
+#
+# Datasource UIDs are FIXED (`prometheus`, `elasticsearch`) so the dashboards
+# in monitoring/grafana/dashboards/*.json (shared with docker-compose) can
+# reference them by uid in both environments.
+#
+# Dashboards: kustomize may not read ../../monitoring/grafana/dashboards
+# (outside this directory), so load them into the OPTIONAL ConfigMap
+# `grafana-dashboards` from the repo root:
+#   kubectl -n monitoring create configmap grafana-dashboards \
+#     --from-file=monitoring/grafana/dashboards/ --dry-run=client -o yaml | kubectl apply -f -
+#   kubectl -n monitoring rollout restart deployment/grafana
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: grafana
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    # Remove stale copies on startup so the provisioned config always wins.
+    deleteDatasources:
+      - name: Prometheus
+        orgId: 1
+      - name: Elasticsearch
+        orgId: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy            # Grafana server makes the request (not the browser)
+        # Cross-namespace DNS: <service>.<namespace>.svc
+        url: http://prometheus.monitoring.svc:9090
+        isDefault: true
+        editable: false
+        jsonData:
+          timeInterval: 15s      # = scrape_interval, for correct rate() windows
+          httpMethod: POST
+
+      - name: Elasticsearch
+        uid: elasticsearch
+        type: elasticsearch
+        access: proxy
+        url: http://elasticsearch.logging.svc:9200
+        editable: false
+        jsonData:
+          # Logstash writes scalebot-{api,user,error,system}-logs-YYYY.MM.dd
+          index: "scalebot-*"
+          timeField: "@timestamp"
+          logMessageField: message
+          logLevelField: level
+          maxConcurrentShardRequests: 5
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: grafana
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: scalebotai
+        orgId: 1
+        folder: ScaleBotAI
+        type: file
+        disableDeletion: true
+        allowUiUpdates: false
+        updateIntervalSeconds: 30
+        options:
+          # Mount point of the optional `grafana-dashboards` ConfigMap.
+          path: /var/lib/grafana-dashboards
+          foldersFromFilesStructure: false

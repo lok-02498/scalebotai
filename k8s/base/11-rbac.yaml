@@ -1,0 +1,218 @@
+# =============================================================================
+# 11-rbac.yaml — identities and least-privilege permissions
+# =============================================================================
+# RBAC building blocks:
+#   ServiceAccount  = identity for a PROCESS (pod, CI job). Humans use
+#                     users/groups from the cluster's authenticator (OIDC, certs).
+#   Role            = list of allowed verbs on resources IN ONE NAMESPACE.
+#   ClusterRole     = same, cluster-wide or for cluster-scoped resources.
+#   RoleBinding     = grants a Role to subjects (SA/user/group) in a namespace.
+# RBAC is purely additive ("deny by default"): anything not granted is denied.
+#
+# Identities in this file:
+#   scalebotai-api    -> the API pods: NO permissions, NO token mounted.
+#   jenkins-deployer  -> the CI/CD pipeline: may roll out new versions, may
+#                        NOT read Secrets, exec into pods or touch other
+#                        namespaces.
+#   scalebotai-viewer -> read-only role for developers (group binding).
+#
+# Test permissions without a cluster-admin token:
+#   kubectl auth can-i patch deployments -n scalebotai \
+#     --as=system:serviceaccount:scalebotai:jenkins-deployer        # yes
+#   kubectl auth can-i get secrets -n scalebotai \
+#     --as=system:serviceaccount:scalebotai:jenkins-deployer        # no
+#   kubectl auth can-i list pods -n scalebotai --as=alice --as-group=scalebotai-developers
+# =============================================================================
+
+# ---- Identity of the API pods -----------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: scalebotai-api
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-api
+    app: scalebotai-api
+# The API never talks to the Kubernetes API, so don't project a token into
+# the pod (if the app were compromised, there would be no credential to steal).
+automountServiceAccountToken: false
+---
+# ---- Identity used by Jenkins ------------------------------------------------
+# Since Kubernetes 1.24 no long-lived token Secret is created automatically.
+# Create a time-bound token and a kubeconfig for the Jenkins credential
+# `kubeconfig-scalebotai` (secret file) — see docs/07 "RBAC model":
+#
+#   TOKEN=$(kubectl -n scalebotai create token jenkins-deployer --duration=720h)
+#   kubectl config set-cluster scalebotai --server=https://<api-server>:6443 \
+#     --certificate-authority=ca.crt --embed-certs=true --kubeconfig=jenkins.kubeconfig
+#   kubectl config set-credentials jenkins-deployer --token="$TOKEN" --kubeconfig=jenkins.kubeconfig
+#   kubectl config set-context jenkins --cluster=scalebotai --user=jenkins-deployer \
+#     --namespace=scalebotai --kubeconfig=jenkins.kubeconfig
+#   kubectl config use-context jenkins --kubeconfig=jenkins.kubeconfig
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-deployer
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: jenkins-deployer
+    app.kubernetes.io/component: cicd
+automountServiceAccountToken: false
+---
+# ---- What Jenkins may do in the scalebotai namespace ---------------------------
+# Scope: everything the pipeline and the strategy scripts need
+#   rolling   : kubectl set image / annotate / rollout status|history|undo
+#   canary    : create + delete scalebotai-api-canary Deployment, canary
+#               Service and canary Ingress (k8s/strategies/canary/*.sh)
+#   blue-green: patch the selector of scalebotai-api-active/-preview
+# and nothing else. Deliberately NOT granted:
+#   * secrets (any verb)     -> CI cannot read DB passwords / JWT key
+#   * pods/exec, pods/attach -> CI cannot open a shell in production pods
+#   * statefulsets, PVCs, PVs, namespaces, RBAC objects, network policies
+# Cluster bootstrap (`kubectl apply -k k8s/base`, which creates namespaces and
+# PVs) is done ONCE by a cluster admin, not by Jenkins.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scalebotai-deployer
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: jenkins-deployer
+    app.kubernetes.io/component: cicd
+rules:
+  # Deployments: roll out images, scale, create/delete the canary & blue/green.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # `kubectl scale` and the HPA-aware rollout tooling use the scale subresource.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+  # ReplicaSets: needed by `rollout status/history/undo` (read the revisions).
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Pods: observe rollouts and readiness (no create/delete/exec).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Read container logs for failed smoke tests.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get", "list"]
+  # `kubectl port-forward svc/scalebotai-api-preview` to smoke-test the idle
+  # blue/green colour or the canary before it receives real traffic.
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+  # Services: patch the blue/green selectors; create/delete canary services.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # EndpointSlices: switch.sh verifies which pods are behind a Service.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # ConfigMaps: update non-secret config (e.g. CHATBOT_MODE) during a release.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Events: diagnose failed rollouts (ImagePullBackOff, FailedScheduling, ...).
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Ingresses: canary ingress (create/annotate weight/delete), blue-green ingress.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # HPA: inspect and tune min/max replicas.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # PDB: read-only (needed for rollout diagnostics).
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scalebotai-deployer
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: jenkins-deployer
+    app.kubernetes.io/component: cicd
+subjects:
+  - kind: ServiceAccount
+    name: jenkins-deployer
+    namespace: scalebotai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: scalebotai-deployer
+---
+# ---- Read-only role for developers / support engineers -----------------------
+# Can look at everything needed to debug (pods, logs, events, rollouts, HPA)
+# but cannot change anything and cannot read Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: scalebotai-viewer
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-viewer
+    app.kubernetes.io/component: rbac
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - configmaps
+      - persistentvolumeclaims
+      - events
+      - serviceaccounts
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # `kubectl top pods` reads metrics-server data.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+# Bind the viewer role to a GROUP coming from the cluster's authenticator
+# (OIDC claim / client-cert O=). Adding a developer = adding them to the group
+# in the identity provider; no Kubernetes change needed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: scalebotai-viewer-developers
+  namespace: scalebotai
+  labels:
+    app.kubernetes.io/name: scalebotai-viewer
+    app.kubernetes.io/component: rbac
+subjects:
+  - kind: Group
+    name: scalebotai-developers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: scalebotai-viewer
